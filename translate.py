@@ -138,131 +138,93 @@ def detect_lang(t: str) -> Optional[str]:
 # ------------------------------------------------------------
 
 def _ollama_translate(texts: List[str], model: str, src: str, tgt: str) -> List[str]:
-    """Batch çeviri (Ollama): ayarlanabilir timeout, basit retry, kısmi tolerans."""
+    """Batch çeviri: timeout ve retry ile; eko/çevirisiz yanıta STRICT retry uygular."""
     if not texts:
         return []
 
-    def _make_prompt(t: str) -> str:
+    def _make_prompt(t: str, strict: bool = False) -> str:
         auto = (src or "").strip().lower() == "auto"
         if auto:
-            return f"""Translate the following text into {tgt}.
-Return only the translation without commentary.
-<<<
-{t}
->>>"""
+            base = f"Translate the following text into {tgt}.\nReturn only the translation without commentary."
         else:
-            return f"""You are a professional translator. Preserve meaning, tone, and style.
-Return only the translation without commentary.
-Source language: {src}
-Target language: {tgt}
-Text:
-<<<
-{t}
->>>"""
+            base = (
+                "You are a professional translator. Preserve meaning, tone, and style.\n"
+                "Return only the translation without commentary.\n"
+                f"Source language: {src}\nTarget language: {tgt}\nText:"
+            )
+        if strict:
+            # Eko / çevirmeme durumunda daha net talimat
+            if auto:
+                base = f"Translate strictly into {tgt}. Return ONLY the translation text. Do NOT repeat the source. Do NOT explain."
+            else:
+                base = (
+                    "You are a STRICT translator. Output ONLY the target-language translation.\n"
+                    "Do NOT echo the source. Do NOT add notes or brackets.\n"
+                    f"Source language: {src}\nTarget language: {tgt}\nText:"
+                )
+        return base + f"\n<<<\n{t}\n>>>"
 
     try:
         to = httpx.Timeout(connect=5.0, read=OLLAMA_TIMEOUT, write=OLLAMA_TIMEOUT, pool=OLLAMA_TIMEOUT)
-    except Exception:  # eski httpx sürümleri
+    except Exception:
         to = OLLAMA_TIMEOUT
 
     bs = max(1, min(int(os.environ.get("BATCH_SIZE", str(BATCH_SIZE))), 16))
     out: List[str] = []
 
-    def _one_call(client: httpx.Client, payload: dict, retries: int = 2) -> str:
+    def _one_call(client: httpx.Client, payload: dict, retries: int = 1) -> str:
         last_err: Optional[Exception] = None
         for attempt in range(retries + 1):
             try:
                 r = client.post("http://127.0.0.1:11434/api/generate", json=payload)
                 r.raise_for_status()
-                return r.json().get("response", "").strip()
+                return (r.json().get("response") or "").strip()
             except Exception as e:
                 last_err = e
-                time.sleep(1.0 * (attempt + 1))
+                time.sleep(0.5 * (attempt + 1))
         raise last_err  # type: ignore
+
+    def _norm(x: str) -> str:
+        return re.sub(r"\s+", " ", (x or "")).strip()
+
+    thread_task = getattr(threading.current_thread(), "task_id", None)
 
     with httpx.Client(timeout=to) as c:
         for i in range(0, len(texts), bs):
             chunk = texts[i:i + bs]
             for t in chunk:
-                payload = {"model": model, "prompt": _make_prompt(t), "stream": False, "options": {"temperature": 0.2}}
+                payload = {"model": model, "prompt": _make_prompt(t, strict=False), "stream": False, "options": {"temperature": 0.2}}
                 try:
-                    resp = _one_call(c, payload, retries=2)
-                    out.append(resp if resp else t)
-                except Exception:
+                    resp = _one_call(c, payload, retries=1)
+                    ns, nr = _norm(t), _norm(resp)
+                    need_retry = (not nr) or (nr.lower() == ns.lower()) or (nr in ns) or (ns in nr)
+                    if need_retry:
+                        # STRICT retry
+                        payload["prompt"] = _make_prompt(t, strict=True)
+                        try:
+                            resp2 = _one_call(c, payload, retries=1)
+                        except Exception as e2:
+                            if thread_task:
+                                try: task_log(thread_task, f"Ollama strict-retry error: {e2}")
+                                except Exception: pass
+                            resp2 = ""
+                        nr2 = _norm(resp2)
+                        if nr2 and (nr2.lower() != ns.lower()) and (nr2 not in ns):
+                            out.append(resp2)
+                            continue
+                        else:
+                            if thread_task:
+                                try: task_log(thread_task, "Ollama: untranslated/echo → keeping source")
+                                except Exception: pass
+                            out.append(t)
+                    else:
+                        out.append(resp)
+                except Exception as e:
+                    if thread_task:
+                        try: task_log(thread_task, f"Ollama error: {e}")
+                        except Exception: pass
                     out.append(t)
     return out
-
-
-# ---- Argos (modern API ile) ----
-
-def _argos_select_translator(src: str, tgt: str, sample_text: Optional[str] = None):
-    """Yüklü dillere göre src->tgt çevirmenini seç."""
-    if not _argo:
-        return None
-
-    # Yüklü dilleri getir
-    try:
-        langs = _argo.load_installed_languages()
-    except Exception:
-        langs = _argo.get_installed_languages() if _argo else []
-
-    if not langs:
-        return None
-
-    # Hedef dil nesnesi
-    tgt_lang = next((l for l in langs if getattr(l, "code", None) == (tgt or "").lower()), None)
-    if not tgt_lang:
-        return None
-
-    # Kaynak dili belirle (auto ise fastText ile tahmin)
-    s = (src or "").lower().strip()
-    if s == "auto":
-        guess = detect_lang(sample_text or "") if sample_text else None
-        s = (guess or "en").lower()
-
-    src_lang = next((l for l in langs if getattr(l, "code", None) == s), None)
-
-    # Önce tam eşleşme
-    if src_lang:
-        try:
-            tr = src_lang.get_translation(tgt_lang)
-            if tr:
-                return tr
-        except Exception:
-            pass
-
-    # Tam eşleşme yoksa: herhangi bir kaynak -> hedef (ilk bulunan)
-    for l in langs:
-        try:
-            tr = l.get_translation(tgt_lang)
-            if tr:
-                return tr
-        except Exception:
-            continue
-
-    return None
-
-
-def _argos_translate_batch(texts: List[str], src: str, tgt: str, sample_text: Optional[str] = None) -> List[str]:
-    if not texts:
-        return []
-    tr = _argos_select_translator(src, tgt, sample_text=sample_text)
-    if not tr:
-        return texts[:]  # güvenli fallback
-    out: List[str] = []
-    for t in texts:
-        try:
-            out.append(tr.translate(t))
-        except Exception:
-            out.append(t)
-    return out
-
-
-def _translate_batch(texts: List[str], model: str, src: str, tgt: str, sample_text: Optional[str] = None) -> List[str]:
-    """Tek giriş noktası: model=='ARGOS' ise Argos, değilse Ollama."""
-    if (model or "").strip().upper() == "ARGOS":
-        return _argos_translate_batch(texts, src, tgt, sample_text=sample_text)
-    return _ollama_translate(texts, model, src, tgt)
 
 # ------------------------------------------------------------
 # STABLE modu (span tabanlı)
