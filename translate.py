@@ -420,8 +420,13 @@ def _ocr_doctr_translate_page(page: fitz.Page, model: str, src: str, tgt: str) -
 # Ana PDF dönüştürücü
 # ------------------------------------------------------------
 
-def translate_pdf(in_path: str, out_path: str, src: str, tgt: str, *, model: str = "ARGOS", pdf_mode: str = "stable", task_id: Optional[str] = None) -> None:
+def translate_pdf(in_path: str, out_path: str, src: str, tgt: str, *, model: str = "ARGOS", pdf_mode: str = "stable", rebuild_output: bool = False, task_id: Optional[str] = None) -> None:
     doc = fitz.open(in_path)
+    # Rebuild tüm belge: tamamen yeniden çizim
+    if rebuild_output:
+        doc.close()
+        translate_pdf_rebuild(in_path, out_path, src, tgt, model=model, task_id=task_id)
+        return
     pages_total = len(doc)
     start_time = time.time()
     if task_id:
@@ -591,9 +596,10 @@ async def api_translate(
     tgt: str = Form(...),
     model: str = Form("ARGOS"),
     pdf_mode: str = Form("stable"),
+    rebuild_output: bool = Form(False),
 ):
     task_id = uuid.uuid4().hex
-    meta = {"pdf_mode": pdf_mode, "src": src, "tgt": tgt, "model": model}
+    meta = {"pdf_mode": pdf_mode, "src": src, "tgt": tgt, "model": model, "rebuild_output": rebuild_output}
     task_init(task_id, meta)
     task_log(task_id, "received request")
 
@@ -606,7 +612,7 @@ async def api_translate(
         task_update(task_id, input_path=in_path, original_name=getattr(file, 'filename', None))
         task_log(task_id, "translation started")
 
-        t = threading.Thread(target=_run_translate, args=(in_path, out_path, src, tgt, model, pdf_mode, task_id), daemon=True)
+        t = threading.Thread(target=_run_translate, args=(in_path, out_path, src, tgt, model, pdf_mode, task_id, rebuild_output), daemon=True)
         t.start()
 
         return JSONResponse({"ok": True, "task_id": task_id})
@@ -970,10 +976,10 @@ def list_models():
         return JSONResponse({"ok": True, "models": models, "warning": str(e)})
 
 
-def _run_translate(in_path: str, out_path: str, src: str, tgt: str, model: str, pdf_mode: str, task_id: str) -> None:
+def _run_translate(in_path: str, out_path: str, src: str, tgt: str, model: str, pdf_mode: str, task_id: str, rebuild_output: bool = False) -> None:
     try:
         threading.current_thread().task_id = task_id  # type: ignore[attr-defined]
-        translate_pdf(in_path, out_path, src, tgt, model=model, pdf_mode=pdf_mode, task_id=task_id)
+        translate_pdf(in_path, out_path, src, tgt, model=model, pdf_mode=pdf_mode, rebuild_output=rebuild_output, task_id=task_id)
         task_done(task_id, out_path)
     except Exception as e:
         try:
