@@ -439,8 +439,12 @@ def translate_pdf(in_path: str, out_path: str, src: str, tgt: str, *, model: str
             _ocr_translate_page(page, model, src, tgt)
         elif pdf_mode == "ocr_doctr":
             _ocr_doctr_translate_page(page, model, src, tgt)
+        elif pdf_mode == "ocr_rebuild":
+            doc.close()
+            translate_pdf_rebuild(in_path, out_path, src, tgt, model=model, task_id=task_id)
+            return
         else:
-            raise ValueError("pdf_mode 'stable' veya 'ocr' veya 'ocr_doctr' olmalı.")
+            raise ValueError("pdf_mode 'stable' veya 'ocr' veya 'ocr_doctr' veya 'ocr_rebuild' olmalı.")
 
         if task_id:
             elapsed = max(0.001, time.time() - start_time)
@@ -1007,3 +1011,116 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
+# ------------------------------------------------------------
+# OCR_REBUILD: PaddleOCR + ReportLab ile sayfayı baştan çiz
+# ------------------------------------------------------------
+def translate_pdf_rebuild(in_path: str, out_path: str, src: str, tgt: str, *, model: str = "ARGOS", task_id: Optional[str] = None) -> None:
+    from reportlab.pdfgen import canvas as _rl_canvas
+    from reportlab.lib.pagesizes import portrait
+    from reportlab.pdfbase import pdfmetrics
+    from reportlab.pdfbase.ttfonts import TTFont
+
+    src_doc = fitz.open(in_path)
+    new_doc = fitz.open()
+    pages_total = len(src_doc)
+    start_time = time.time()
+    if task_id:
+        task_update(task_id, pages_total=pages_total, status="running")
+        task_log(task_id, f"OCR_REBUILD start: {pages_total} pages")
+
+    # Font seçimi (Noto varsa onu kullan)
+    noto_regular = FONT_MAP.get('regular')
+    font_name = 'Helvetica'
+    if noto_regular and os.path.exists(noto_regular):
+        try:
+            pdfmetrics.registerFont(TTFont('NotoSans', noto_regular))
+            font_name = 'NotoSans'
+        except Exception:
+            font_name = 'Helvetica'
+
+    # OCR örneği
+    ocr_lang = _src_to_paddle_lang(src)
+    ocr = _get_ocr(lang=ocr_lang)
+
+    for page_index, page in enumerate(src_doc, start=1):
+        if task_id:
+            task_update(task_id, page=page_index, progress=round((page_index - 1) / pages_total * 100, 1))
+            task_log(task_id, f"OCR_REBUILD page {page_index}/{pages_total}")
+
+        pw, ph = page.rect.width, page.rect.height
+
+        # OCR için raster
+        png_path, scale = _page_to_png(page, scale=OCR_SCALE)
+        try:
+            result = ocr.ocr(png_path, cls=False)
+            boxes, texts = [], []
+            for line in (result[0] or []):
+                (x0,y0),(x1,y1),(x2,y2),(x3,y3) = line[0]
+                rx0 = min(x0,x1,x2,x3) / scale
+                ry0 = min(y0,y1,y2,y3) / scale
+                rx1 = max(x0,x1,x2,x3) / scale
+                ry1 = max(y0,y1,y2,y3) / scale
+                boxes.append((rx0, ry0, rx1, ry1))
+                texts.append(line[1][0])
+
+            # Metin yoksa boş sayfa
+            if not texts:
+                tmp_pdf = _render_empty_pdf(pw, ph)
+                with fitz.open(tmp_pdf) as rd:
+                    new_doc.insert_pdf(rd)
+                try: os.remove(tmp_pdf)
+                except Exception: pass
+                continue
+
+            # Çeviri
+            sample = " ".join(texts[:40])[:2000]
+            translations = _translate_batch(texts, model, src, tgt, sample_text=sample)
+
+            # ReportLab ile tek sayfa PDF üret ve bbox'lara yaz
+            tmp_path = os.path.join(TMP_DIR, f"reb_{uuid.uuid4().hex}.pdf")
+            c = _rl_canvas.Canvas(tmp_path, pagesize=portrait((pw, ph)))
+            def yflip(y): return ph - y  # RL alt-sol, fitz üst-sol
+
+            for (x0, y0, x1, y1), txt in zip(boxes, translations):
+                h = (y1 - y0)
+                fontsize = max(8, min(28, h))
+                try:
+                    c.setFont(font_name, fontsize)
+                except Exception:
+                    c.setFont("Helvetica", fontsize)
+                # İlk iterasyon: tek satır. (Sonraki adımda wrap eklenecek)
+                c.drawString(x0, yflip(y1) + 0.2*fontsize, txt)
+
+            c.showPage(); c.save()
+
+            with fitz.open(tmp_path) as rd:
+                new_doc.insert_pdf(rd)
+            try: os.remove(tmp_path)
+            except Exception: pass
+
+        finally:
+            try: os.remove(png_path)
+            except Exception: pass
+
+        if task_id:
+            elapsed = max(0.001, time.time() - start_time)
+            done = page_index
+            eta = (elapsed / done) * max(0, pages_total - done)
+            task_update(task_id, progress=round(done / pages_total * 100, 1), eta_sec=int(eta))
+
+    new_doc.save(out_path, garbage=4, deflate=True, clean=True)
+    new_doc.close()
+    src_doc.close()
+    if task_id:
+        task_update(task_id, progress=100.0)
+        task_log(task_id, f"OCR_REBUILD saved -> {out_path}")
+
+def _render_empty_pdf(pw: float, ph: float) -> str:
+    from reportlab.pdfgen import canvas as _rl_canvas
+    from reportlab.lib.pagesizes import portrait
+    tmp_path = os.path.join(TMP_DIR, f"empty_{uuid.uuid4().hex}.pdf")
+    c = _rl_canvas.Canvas(tmp_path, pagesize=portrait((pw, ph)))
+    c.showPage(); c.save()
+    return tmp_path
