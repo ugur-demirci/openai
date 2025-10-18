@@ -1124,3 +1124,52 @@ def _render_empty_pdf(pw: float, ph: float) -> str:
     c = _rl_canvas.Canvas(tmp_path, pagesize=portrait((pw, ph)))
     c.showPage(); c.save()
     return tmp_path
+
+
+# ------------------------------------------------------------
+# Fallback batch translator for OCR_REBUILD
+# ------------------------------------------------------------
+def _translate_batch(texts, model, src, tgt, sample_text=None):
+    out = []
+    try:
+        if (model or "").strip().upper() == "ARGOS":
+            try:
+                import argostranslate.package, argostranslate.translate
+            except Exception:
+                return [t for t in texts]
+            for t in texts:
+                try:
+                    out.append(argostranslate.translate.translate(t, src, tgt))
+                except Exception:
+                    out.append(t)
+            return out
+        else:
+            import requests, json
+            url = "http://127.0.0.1:11434/api/generate"
+            headers = {"Content-Type":"application/json"}
+            prompt_tpl = (
+                "You are a professional translator. Preserve meaning, tone, and style.\\n"
+                "Return only the translation without commentary.\\n"
+                "Source language: {src}\\n"
+                "Target language: {tgt}\\n"
+                "Text:\\n<<<\\n{txt}\\n>>>"
+            )
+            for t in texts:
+                payload = {
+                    "model": model,
+                    "prompt": prompt_tpl.format(src=src, tgt=tgt, txt=t),
+                    "stream": False,
+                    "options": {"temperature": 0.2}
+                }
+                try:
+                    r = requests.post(url, headers=headers, data=json.dumps(payload), timeout=180)
+                    if r.ok:
+                        js = r.json()
+                        out.append((js.get("response") or "").strip() or t)
+                    else:
+                        out.append(t)
+                except Exception:
+                    out.append(t)
+            return out
+    except Exception:
+        return [t for t in texts]
