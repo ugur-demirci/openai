@@ -327,14 +327,17 @@ def _get_ocr(lang: str = 'en'):
     if _OCR_INSTANCE is None:
         if PaddleOCR is None:
             raise RuntimeError("PaddleOCR yüklü değil. 'pip install paddleocr paddlepaddle-gpu' gerekli.")
-        
         try:
             if paddle:
-                # Auto-select GPU if available
+                # CUDA varsa GPU, yoksa CPU
                 paddle.device.set_device('gpu' if paddle.device.is_compiled_with_cuda() else 'cpu')
-except Exception:
-            pass
-        _OCR_INSTANCE = PaddleOCR(use_angle_cls=False, use_gpu=(paddle.device.is_compiled_with_cuda() if paddle else False), lang=lang)
+        except Exception as e:
+            print('Paddle device init warning:', e)
+        _OCR_INSTANCE = PaddleOCR(
+            use_angle_cls=False,
+            use_gpu=(paddle.device.is_compiled_with_cuda() if paddle else False),
+            lang=lang
+        )
     return _OCR_INSTANCE
 
 
