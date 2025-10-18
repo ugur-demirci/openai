@@ -11,6 +11,9 @@ translate.py (v0.3.2-clean)
     /metrics (CPU/GPU), /models (Ollama tags), root UI
 - Tunables (env): OCR_SCALE, BATCH_SIZE, OLLAMA_TIMEOUT
 """
+
+
+deneme
 from __future__ import annotations
 
 import argparse
