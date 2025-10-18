@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-translate.py (v0.4.0-argos)
-- PDF→PDF: stable (span tabanlı) + ocr (PaddleOCR) + ocr_doctr (PyTorch/docTR) modları
+translate.py (v0.4.1-argos-fix)
+- PDF→PDF: stable (span tabanlı) + ocr (PaddleOCR) + ocr_doctr (PyTorch/docTR)
 - Çeviri motoru seçimi:
-    * ARGOS: tamamen offline, yerel paketlerden
+    * ARGOS: tamamen offline, yerel paketlerden (argostranslate >=1.9 API uyumlu)
     * Ollama: http://127.0.0.1:11434 (model adı ile)
 - NotoSans fontfile gömme (varsa); yoksa Helvetica
 - FastAPI:
@@ -72,13 +72,11 @@ try:
 except Exception:  # pragma: no cover
     _FT = None
 
-# ---- Argos Translate ----
+# ---- Argos Translate (modern API) ----
 try:
-    from argostranslate import package as _argos_package  # type: ignore
-    from argostranslate import translate as _argos_translate  # type: ignore
+    from argostranslate import translate as _argo  # type: ignore
 except Exception:  # pragma: no cover
-    _argos_package = None  # type: ignore
-    _argos_translate = None  # type: ignore
+    _argo = None  # type: ignore
 
 # ------------------------------------------------------------
 # Konfig
@@ -123,7 +121,6 @@ def _choose_fontfile(span_fontname: str) -> Tuple[str, bool]:
 
 def _rgb_from_int(i: int) -> Tuple[float, float, float]:
     r, g, b = ((i >> 16) & 255), ((i >> 8) & 255), (i & 255)
-    # PyMuPDF renk bileşenleri 0..1 aralığında float bekler
     return (r/255.0, g/255.0, b/255.0)
 
 
@@ -180,8 +177,7 @@ Text:
                 return r.json().get("response", "").strip()
             except Exception as e:
                 last_err = e
-                time.sleep(1.0 * (attempt + 1))  # basit artan bekleme
-        # tüm denemeler biterse hata
+                time.sleep(1.0 * (attempt + 1))
         raise last_err  # type: ignore
 
     with httpx.Client(timeout=to) as c:
@@ -193,73 +189,79 @@ Text:
                     resp = _one_call(c, payload, retries=2)
                     out.append(resp if resp else t)
                 except Exception:
-                    # Tamamen patlarsa orijinali geri yaz ve ilerle
                     out.append(t)
     return out
 
 
-# ---- Argos entegrasyonu ----
+# ---- Argos (modern API ile) ----
 
-def _argos_find_translator(src: str, tgt: str) -> Optional[object]:
-    """Yüklü çevirmenlerden src->tgt eşleşmesini bul.
-    src='auto' ise fastText ile bulmayı dener, olmazsa hedefe uygun 'en iyi' eşleşmeyi seçer.
-    """
-    if not _argos_translate:
+def _argos_select_translator(src: str, tgt: str, sample_text: Optional[str] = None):
+    """Yüklü dillere göre src->tgt çevirmenini seç."""
+    if not _argo:
         return None
 
+    # Yüklü dilleri getir
     try:
-        _argos_translate.load_installed_packages()
+        langs = _argo.load_installed_languages()
     except Exception:
-        pass
+        langs = _argo.get_installed_languages() if _argo else []
 
-    translators = _argos_translate.get_translators() or []
+    if not langs:
+        return None
 
-    # normalize
-    s = (src or '').lower().strip()
-    t = (tgt or '').lower().strip()
-    if s == 'auto':
-        s = detect_lang("Merhaba") or 'en'  # min. bir default
-        # gerçek içerikten tespit, mümkünse daha iyi:
-        # üst katman zaten ilk sayfa metninden detection yapıyor, burada basit kalsın
+    # Hedef dil nesnesi
+    tgt_lang = next((l for l in langs if getattr(l, "code", None) == (tgt or "").lower()), None)
+    if not tgt_lang:
+        return None
 
-    # tam eşleşme
-    for tr in translators:
+    # Kaynak dili belirle (auto ise fastText ile tahmin)
+    s = (src or "").lower().strip()
+    if s == "auto":
+        guess = detect_lang(sample_text or "") if sample_text else None
+        s = (guess or "en").lower()
+
+    src_lang = next((l for l in langs if getattr(l, "code", None) == s), None)
+
+    # Önce tam eşleşme
+    if src_lang:
         try:
-            if getattr(tr, 'from_lang', None) == s and getattr(tr, 'to_lang', None) == t:
+            tr = src_lang.get_translation(tgt_lang)
+            if tr:
+                return tr
+        except Exception:
+            pass
+
+    # Tam eşleşme yoksa: herhangi bir kaynak -> hedef (ilk bulunan)
+    for l in langs:
+        try:
+            tr = l.get_translation(tgt_lang)
+            if tr:
                 return tr
         except Exception:
             continue
 
-    # kaynak dili bilemediysek, hedefe uygun olanlardan birini seç (ör. en çok kullanılan from_lang)
-    for tr in translators:
-        try:
-            if getattr(tr, 'to_lang', None) == t:
-                return tr
-        except Exception:
-            continue
     return None
 
 
-def _argos_translate_batch(texts: List[str], src: str, tgt: str) -> List[str]:
+def _argos_translate_batch(texts: List[str], src: str, tgt: str, sample_text: Optional[str] = None) -> List[str]:
     if not texts:
         return []
-    tr = _argos_find_translator(src, tgt)
+    tr = _argos_select_translator(src, tgt, sample_text=sample_text)
     if not tr:
-        # çevirmensiz: güvenli fallback (orijinali döndür)
-        return texts[:]
+        return texts[:]  # güvenli fallback
     out: List[str] = []
     for t in texts:
         try:
             out.append(tr.translate(t))
         except Exception:
-            out.append(t)  # tekil hata -> orijinali koru
+            out.append(t)
     return out
 
 
-def _translate_batch(texts: List[str], model: str, src: str, tgt: str) -> List[str]:
+def _translate_batch(texts: List[str], model: str, src: str, tgt: str, sample_text: Optional[str] = None) -> List[str]:
     """Tek giriş noktası: model=='ARGOS' ise Argos, değilse Ollama."""
     if (model or "").strip().upper() == "ARGOS":
-        return _argos_translate_batch(texts, src, tgt)
+        return _argos_translate_batch(texts, src, tgt, sample_text=sample_text)
     return _ollama_translate(texts, model, src, tgt)
 
 # ------------------------------------------------------------
@@ -267,7 +269,6 @@ def _translate_batch(texts: List[str], model: str, src: str, tgt: str) -> List[s
 # ------------------------------------------------------------
 
 def _extract_spans(page: fitz.Page) -> List[dict]:
-    # 'rawdict' daha fazla span ve konum koruması sağlar
     data = page.get_text("rawdict")
     spans: List[dict] = []
     for b in data.get("blocks", []):
@@ -287,12 +288,14 @@ def _extract_spans(page: fitz.Page) -> List[dict]:
 
 def _stable_translate_page(page: fitz.Page, model: str, src: str, tgt: str) -> None:
     spans = _extract_spans(page)
-    # Hibrit fallback: span yoksa ya da çok azsa docTR OCR'a düş
+    # Span yok/az ise docTR'a düş
     if (not spans) or (sum(len(s.get("text","")) for s in spans) < 20) or (len(spans) < 3):
         task_log(getattr(threading.current_thread(), 'task_id', 'NA'), "stable: low span density -> fallback to docTR")
         _ocr_doctr_translate_page(page, model, src, tgt)
         return
-    translations = _translate_batch([s["text"] for s in spans], model, src, tgt)
+    # Argos'ta src=auto için örnek metin (ilk spanlardan)
+    sample = " ".join(s["text"] for s in spans[:8])[:2000]
+    translations = _translate_batch([s["text"] for s in spans], model, src, tgt, sample_text=sample)
     for s in spans:
         page.add_redact_annot(fitz.Rect(s["bbox"]), fill=None)
     page.apply_redactions()
@@ -311,7 +314,6 @@ def _stable_translate_page(page: fitz.Page, model: str, src: str, tgt: str) -> N
 _OCR_INSTANCE = None
 
 def _src_to_paddle_lang(src: str) -> str:
-    """Kaynak dili PaddleOCR lang koduna yaklaşık eşle."""
     m = {
         'tr': 'tr', 'en': 'en', 'de': 'de', 'fr': 'fr', 'es': 'es', 'ru': 'ru', 'nl': 'latin', 'uk': 'cyrillic'
     }
@@ -325,14 +327,12 @@ def _get_ocr(lang: str = 'en'):
     if _OCR_INSTANCE is None:
         if PaddleOCR is None:
             raise RuntimeError("PaddleOCR yüklü değil. 'pip install paddleocr paddlepaddle-gpu' gerekli.")
-        # GPU'da cuDNN sorunu varsa CPU'ya zorla
         os.environ.setdefault('CUDA_VISIBLE_DEVICES', '')
         try:
             if paddle:
                 paddle.device.set_device('cpu')
         except Exception:
             pass
-        # use_gpu=False ile CPU'ya sabitliyoruz
         _OCR_INSTANCE = PaddleOCR(use_angle_cls=False, use_gpu=False, lang=lang)
     return _OCR_INSTANCE
 
@@ -368,13 +368,14 @@ def _ocr_translate_page(page: fitz.Page, model: str, src: str, tgt: str) -> None
             texts.append(line[1][0])
             count_lines += 1
         if not texts:
-            task_log(getattr(threading.current_thread(), 'task_id', 'NA'), f"PaddleOCR: no text detected")
+            task_log(getattr(threading.current_thread(), 'task_id', 'NA'), "PaddleOCR: no text detected")
             return
         task_log(getattr(threading.current_thread(), 'task_id', 'NA'), f"PaddleOCR: lines={count_lines}, to_translate={len(texts)}")
-        translations = _translate_batch(texts, model, src, tgt)
+        sample = " ".join(texts[:40])[:2000]
+        translations = _translate_batch(texts, model, src, tgt, sample_text=sample)
         for bb, txt in zip(boxes, translations):
             rect = fitz.Rect(bb)
-            fontsize = max(10, min(28, rect.height))  # biraz daha esnek
+            fontsize = max(10, min(28, rect.height))
             fontfile, is_file = _choose_fontfile("NotoSans")
             if is_file:
                 page.insert_textbox(rect, txt, fontfile=fontfile, fontsize=fontsize, color=(0.0, 0.0, 0.0))
@@ -410,7 +411,7 @@ def _ocr_doctr_translate_page(page: fitz.Page, model: str, src: str, tgt: str) -
         pred = _get_doctr()
         doc = DocumentFile.from_images([png_path])
         res = pred(doc)
-        export = res.export()  # normalized [0,1] koordinatlar
+        export = res.export()  # normalized [0,1]
         if not export.get('pages'):
             task_log(getattr(threading.current_thread(), 'task_id', 'NA'), "docTR: no pages in export")
             return
@@ -433,7 +434,8 @@ def _ocr_doctr_translate_page(page: fitz.Page, model: str, src: str, tgt: str) -
             task_log(getattr(threading.current_thread(), 'task_id', 'NA'), "docTR: no text detected")
             return
         task_log(getattr(threading.current_thread(), 'task_id', 'NA'), f"docTR: lines={count_lines}, to_translate={len(texts)}")
-        translations = _translate_batch(texts, model, src, tgt)
+        sample = " ".join(texts[:40])[:2000]
+        translations = _translate_batch(texts, model, src, tgt, sample_text=sample)
         for bb, txt in zip(boxes, translations):
             rect = fitz.Rect(bb)
             fontsize = max(10, min(28, rect.height))
@@ -566,7 +568,6 @@ def task_init(task_id: str, meta: dict) -> dict:
     }
     with _TASK_LOCK:
         TASKS[task_id] = d
-    # ensure log file exists with header
     try:
         with open(d["log_path"], "a", encoding="utf-8") as f:
             f.write(f"[{_now_iso()}] TASK INIT: task_id={task_id} mode={d['mode']} src={d['src']} tgt={d['tgt']} model={d['model']}\n")
@@ -610,7 +611,7 @@ def task_done(task_id: str, output_path: str) -> None:
 # FastAPI App & Endpoints
 # ------------------------------------------------------------
 
-app = FastAPI(title="offlineAI translate-api", version="v0.4.0-argos")
+app = FastAPI(title="offlineAI translate-api", version="v0.4.1-argos-fix")
 
 
 @app.post("/translate")
@@ -621,7 +622,6 @@ async def api_translate(
     model: str = Form("ARGOS"),
     pdf_mode: str = Form("stable"),
 ):
-    # --- task create ---
     task_id = uuid.uuid4().hex
     meta = {"pdf_mode": pdf_mode, "src": src, "tgt": tgt, "model": model}
     task_init(task_id, meta)
@@ -631,17 +631,14 @@ async def api_translate(
     in_path = os.path.join(TMP_DIR, f"upload_{ts}_{task_id}.pdf")
     out_path = os.path.join(TMP_DIR, f"translated_{ts}_{task_id}.pdf")
     try:
-        # save upload
         with open(in_path, "wb") as f:
             f.write(await file.read())
         task_update(task_id, input_path=in_path, original_name=getattr(file, 'filename', None))
         task_log(task_id, "translation started")
 
-        # run translation in background thread
         t = threading.Thread(target=_run_translate, args=(in_path, out_path, src, tgt, model, pdf_mode, task_id), daemon=True)
         t.start()
 
-        # dönerken output_path daha hazır değil; status üzerinden izlenecek
         return JSONResponse({"ok": True, "task_id": task_id})
     except Exception as e:
         try:
@@ -704,7 +701,6 @@ def get_logs(task_id: str, tail: int = 200):
         d = TASKS.get(task_id)
     log_path = d["log_path"] if d else os.path.join(LOG_DIR, f"{task_id}.log")
     if not os.path.exists(log_path):
-        # log dosyası yoksa boş log döndür
         return JSONResponse({"ok": True, "log": ""})
     try:
         with open(log_path, "r", encoding="utf-8") as f:
@@ -855,14 +851,14 @@ async function loadModels(){
     const r = await fetch('/models');
     const j = await r.json();
     const sel = document.getElementById('model');
-    if(!j.ok) throw new Error(j.error||'models failed');
+    if(!j.ok && !Array.isArray(j.models)) throw new Error(j.error||'models failed');
     const cur = sel.value;
     sel.innerHTML = '';
     // ARGOS her zaman en üstte
     const opt0=document.createElement('option');
     opt0.value='ARGOS'; opt0.textContent='ARGOS'; sel.appendChild(opt0);
     (j.models||[]).forEach(name=>{
-      if(name && name.toUpperCase()!=='ARGOS'){
+      if(name && String(name).toUpperCase()!=='ARGOS'){
         const opt=document.createElement('option');
         opt.value=name; opt.textContent=name; sel.appendChild(opt);
       }
@@ -933,7 +929,6 @@ window.addEventListener('load', ()=>{ loadModels(); pollMetrics(); mpoll = setIn
 
 @app.get("/download/{task_id}")
 def download(task_id: str):
-    # Task ve/veya snap'ten meta oku
     with _TASK_LOCK:
         d = TASKS.get(task_id)
     if not d:
@@ -951,20 +946,16 @@ def download(task_id: str):
     if not out_path or not os.path.exists(out_path):
         return JSONResponse({"ok": False, "error": "file not found"}, status_code=404)
 
-    # Güvenlik: sadece TMP_DIR altını servis et
     abs_tmp = os.path.abspath(TMP_DIR)
     abs_out = os.path.abspath(out_path)
     if not abs_out.startswith(abs_tmp + os.sep):
         return JSONResponse({"ok": False, "error": "invalid path"}, status_code=403)
 
-    # İsimlendirme: orijinal + [SRC-TGT].pdf
     orig_name = d.get("original_name") or os.path.basename(out_path)
     base = os.path.splitext(os.path.basename(orig_name))[0]
 
-    # Hedef dil
     tgt = (d.get("tgt") or "xx").upper()
 
-    # Kaynak dil: eğer src=auto ise input PDF'ten hızlı tespit (PyMuPDF + fastText)
     src_cfg = (d.get("src") or "xx").lower()
     src = src_cfg
     if src_cfg == "auto":
@@ -986,25 +977,20 @@ def download(task_id: str):
     safe = re.sub(r"[^0-9A-Za-z_.-]+", " ", base).strip()
     dl_name = f"{safe} [{src}-{tgt}].pdf" if safe else f"translated_{task_id} [{src}-{tgt}].pdf"
 
-    return FileResponse(abs_out, media_type="application/pdf", filename=dl_name)
+    return FileResponse(os.path.abspath(out_path), media_type="application/pdf", filename=dl_name)
 
 
 @app.get("/models")
 def list_models():
-    """ARGOS'u sabit döndür + Ollama tag'lerini ekle.
-    UI 'Ollama Yenile' butonu bu uca bakıyor.
-    """
+    """ARGOS'u sabit döndür + Ollama tag'lerini ekle. 'Ollama Yenile' bu uca bakıyor."""
     models: List[str] = []
     try:
-        # ARGOS en üstte
-        models.append("ARGOS")
-        # Ollama modelleri
+        models.append("ARGOS")  # her zaman en üstte
         with httpx.Client(timeout=5.0) as c:
             r = c.get("http://127.0.0.1:11434/api/tags")
             r.raise_for_status()
             data = r.json()
             names = [m.get("name") for m in data.get("models", []) if m.get("name")]
-            # 'ARGOS' ile çakışma olursa filtrele
             for n in names:
                 if n and str(n).upper() != "ARGOS":
                     models.append(n)
@@ -1016,7 +1002,6 @@ def list_models():
 
 def _run_translate(in_path: str, out_path: str, src: str, tgt: str, model: str, pdf_mode: str, task_id: str) -> None:
     try:
-        # thread-local task_id for logging helpers
         threading.current_thread().task_id = task_id  # type: ignore[attr-defined]
         translate_pdf(in_path, out_path, src, tgt, model=model, pdf_mode=pdf_mode, task_id=task_id)
         task_done(task_id, out_path)
@@ -1043,7 +1028,6 @@ def main():
     args = ap.parse_args()
 
     if args.serve:
-        # Uvicorn module path: bu dosya adı translate.py ise 'translate:app'
         uvicorn.run("translate:app", host="0.0.0.0", port=8080)
         return
 
