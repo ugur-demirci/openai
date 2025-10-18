@@ -1,14 +1,16 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-translate.py (v0.3.2-clean)
+translate.py (v0.4.0-argos)
 - PDF→PDF: stable (span tabanlı) + ocr (PaddleOCR) + ocr_doctr (PyTorch/docTR) modları
-- Ollama model ile çeviri (offline)
+- Çeviri motoru seçimi:
+    * ARGOS: tamamen offline, yerel paketlerden
+    * Ollama: http://127.0.0.1:11434 (model adı ile)
 - NotoSans fontfile gömme (varsa); yoksa Helvetica
 - FastAPI:
     /translate (async, background thread)
     /status/{task_id}, /logs/{task_id}, /download/{task_id}
-    /metrics (CPU/GPU), /models (Ollama tags), root UI
+    /metrics (CPU/GPU), /models (ARGOS + Ollama tags), root UI
 - Tunables (env): OCR_SCALE, BATCH_SIZE, OLLAMA_TIMEOUT
 """
 from __future__ import annotations
@@ -70,6 +72,14 @@ try:
 except Exception:  # pragma: no cover
     _FT = None
 
+# ---- Argos Translate ----
+try:
+    from argostranslate import package as _argos_package  # type: ignore
+    from argostranslate import translate as _argos_translate  # type: ignore
+except Exception:  # pragma: no cover
+    _argos_package = None  # type: ignore
+    _argos_translate = None  # type: ignore
+
 # ------------------------------------------------------------
 # Konfig
 # ------------------------------------------------------------
@@ -127,11 +137,11 @@ def detect_lang(t: str) -> Optional[str]:
         return None
 
 # ------------------------------------------------------------
-# Ollama çeviri (batch)
+# ÇEVİRİ MOTORLARI
 # ------------------------------------------------------------
 
 def _ollama_translate(texts: List[str], model: str, src: str, tgt: str) -> List[str]:
-    """Batch çeviri: ayarlanabilir timeout, basit retry, kısmi tolerans."""
+    """Batch çeviri (Ollama): ayarlanabilir timeout, basit retry, kısmi tolerans."""
     if not texts:
         return []
 
@@ -153,7 +163,6 @@ Text:
 {t}
 >>>"""
 
-    # httpx Timeout: connect kısa, read/write uzun
     try:
         to = httpx.Timeout(connect=5.0, read=OLLAMA_TIMEOUT, write=OLLAMA_TIMEOUT, pool=OLLAMA_TIMEOUT)
     except Exception:  # eski httpx sürümleri
@@ -188,6 +197,71 @@ Text:
                     out.append(t)
     return out
 
+
+# ---- Argos entegrasyonu ----
+
+def _argos_find_translator(src: str, tgt: str) -> Optional[object]:
+    """Yüklü çevirmenlerden src->tgt eşleşmesini bul.
+    src='auto' ise fastText ile bulmayı dener, olmazsa hedefe uygun 'en iyi' eşleşmeyi seçer.
+    """
+    if not _argos_translate:
+        return None
+
+    try:
+        _argos_translate.load_installed_packages()
+    except Exception:
+        pass
+
+    translators = _argos_translate.get_translators() or []
+
+    # normalize
+    s = (src or '').lower().strip()
+    t = (tgt or '').lower().strip()
+    if s == 'auto':
+        s = detect_lang("Merhaba") or 'en'  # min. bir default
+        # gerçek içerikten tespit, mümkünse daha iyi:
+        # üst katman zaten ilk sayfa metninden detection yapıyor, burada basit kalsın
+
+    # tam eşleşme
+    for tr in translators:
+        try:
+            if getattr(tr, 'from_lang', None) == s and getattr(tr, 'to_lang', None) == t:
+                return tr
+        except Exception:
+            continue
+
+    # kaynak dili bilemediysek, hedefe uygun olanlardan birini seç (ör. en çok kullanılan from_lang)
+    for tr in translators:
+        try:
+            if getattr(tr, 'to_lang', None) == t:
+                return tr
+        except Exception:
+            continue
+    return None
+
+
+def _argos_translate_batch(texts: List[str], src: str, tgt: str) -> List[str]:
+    if not texts:
+        return []
+    tr = _argos_find_translator(src, tgt)
+    if not tr:
+        # çevirmensiz: güvenli fallback (orijinali döndür)
+        return texts[:]
+    out: List[str] = []
+    for t in texts:
+        try:
+            out.append(tr.translate(t))
+        except Exception:
+            out.append(t)  # tekil hata -> orijinali koru
+    return out
+
+
+def _translate_batch(texts: List[str], model: str, src: str, tgt: str) -> List[str]:
+    """Tek giriş noktası: model=='ARGOS' ise Argos, değilse Ollama."""
+    if (model or "").strip().upper() == "ARGOS":
+        return _argos_translate_batch(texts, src, tgt)
+    return _ollama_translate(texts, model, src, tgt)
+
 # ------------------------------------------------------------
 # STABLE modu (span tabanlı)
 # ------------------------------------------------------------
@@ -218,7 +292,7 @@ def _stable_translate_page(page: fitz.Page, model: str, src: str, tgt: str) -> N
         task_log(getattr(threading.current_thread(), 'task_id', 'NA'), "stable: low span density -> fallback to docTR")
         _ocr_doctr_translate_page(page, model, src, tgt)
         return
-    translations = _ollama_translate([s["text"] for s in spans], model, src, tgt)
+    translations = _translate_batch([s["text"] for s in spans], model, src, tgt)
     for s in spans:
         page.add_redact_annot(fitz.Rect(s["bbox"]), fill=None)
     page.apply_redactions()
@@ -297,7 +371,7 @@ def _ocr_translate_page(page: fitz.Page, model: str, src: str, tgt: str) -> None
             task_log(getattr(threading.current_thread(), 'task_id', 'NA'), f"PaddleOCR: no text detected")
             return
         task_log(getattr(threading.current_thread(), 'task_id', 'NA'), f"PaddleOCR: lines={count_lines}, to_translate={len(texts)}")
-        translations = _ollama_translate(texts, model, src, tgt)
+        translations = _translate_batch(texts, model, src, tgt)
         for bb, txt in zip(boxes, translations):
             rect = fitz.Rect(bb)
             fontsize = max(10, min(28, rect.height))  # biraz daha esnek
@@ -359,7 +433,7 @@ def _ocr_doctr_translate_page(page: fitz.Page, model: str, src: str, tgt: str) -
             task_log(getattr(threading.current_thread(), 'task_id', 'NA'), "docTR: no text detected")
             return
         task_log(getattr(threading.current_thread(), 'task_id', 'NA'), f"docTR: lines={count_lines}, to_translate={len(texts)}")
-        translations = _ollama_translate(texts, model, src, tgt)
+        translations = _translate_batch(texts, model, src, tgt)
         for bb, txt in zip(boxes, translations):
             rect = fitz.Rect(bb)
             fontsize = max(10, min(28, rect.height))
@@ -378,7 +452,7 @@ def _ocr_doctr_translate_page(page: fitz.Page, model: str, src: str, tgt: str) -
 # Ana PDF dönüştürücü
 # ------------------------------------------------------------
 
-def translate_pdf(in_path: str, out_path: str, src: str, tgt: str, *, model: str = "qwen2.5:7b", pdf_mode: str = "stable", task_id: Optional[str] = None) -> None:
+def translate_pdf(in_path: str, out_path: str, src: str, tgt: str, *, model: str = "ARGOS", pdf_mode: str = "stable", task_id: Optional[str] = None) -> None:
     doc = fitz.open(in_path)
     pages_total = len(doc)
     start_time = time.time()
@@ -536,7 +610,7 @@ def task_done(task_id: str, output_path: str) -> None:
 # FastAPI App & Endpoints
 # ------------------------------------------------------------
 
-app = FastAPI(title="offlineAI translate-api", version="0.3.2-clean")
+app = FastAPI(title="offlineAI translate-api", version="v0.4.0-argos")
 
 
 @app.post("/translate")
@@ -544,7 +618,7 @@ async def api_translate(
     file: UploadFile = File(...),
     src: str = Form(...),
     tgt: str = Form(...),
-    model: str = Form("qwen2.5:7b"),
+    model: str = Form("ARGOS"),
     pdf_mode: str = Form("stable"),
 ):
     # --- task create ---
@@ -718,8 +792,8 @@ def ui() -> HTMLResponse:
           </select>
         </div>
         <div>
-          <label>Model (Ollama)</label>
-          <select id="model" name="model"><option value="qwen2.5:7b">qwen2.5:7b</option></select>
+          <label>Model</label>
+          <select id="model" name="model"><option value="ARGOS">ARGOS</option></select>
         </div>
       </div>
 
@@ -784,9 +858,14 @@ async function loadModels(){
     if(!j.ok) throw new Error(j.error||'models failed');
     const cur = sel.value;
     sel.innerHTML = '';
+    // ARGOS her zaman en üstte
+    const opt0=document.createElement('option');
+    opt0.value='ARGOS'; opt0.textContent='ARGOS'; sel.appendChild(opt0);
     (j.models||[]).forEach(name=>{
-      const opt=document.createElement('option');
-      opt.value=name; opt.textContent=name; sel.appendChild(opt);
+      if(name && name.toUpperCase()!=='ARGOS'){
+        const opt=document.createElement('option');
+        opt.value=name; opt.textContent=name; sel.appendChild(opt);
+      }
     });
     const found = Array.from(sel.options).some(o=>o.value===cur);
     if(found) sel.value = cur;
@@ -805,7 +884,7 @@ async function start(){
   form.append('file', file);
   form.append('src', document.getElementById('src').value);
   form.append('tgt', document.getElementById('tgt').value);
-  form.append('model', document.getElementById('model').value || 'qwen2.5:7b');
+  form.append('model', document.getElementById('model').value || 'ARGOS');
   form.append('pdf_mode', document.getElementById('pdf_mode').value);
   try{
     const r = await fetch('/translate', {method:'POST', body:form});
@@ -912,15 +991,27 @@ def download(task_id: str):
 
 @app.get("/models")
 def list_models():
+    """ARGOS'u sabit döndür + Ollama tag'lerini ekle.
+    UI 'Ollama Yenile' butonu bu uca bakıyor.
+    """
+    models: List[str] = []
     try:
+        # ARGOS en üstte
+        models.append("ARGOS")
+        # Ollama modelleri
         with httpx.Client(timeout=5.0) as c:
             r = c.get("http://127.0.0.1:11434/api/tags")
             r.raise_for_status()
             data = r.json()
             names = [m.get("name") for m in data.get("models", []) if m.get("name")]
-            return JSONResponse({"ok": True, "models": names})
+            # 'ARGOS' ile çakışma olursa filtrele
+            for n in names:
+                if n and str(n).upper() != "ARGOS":
+                    models.append(n)
+        return JSONResponse({"ok": True, "models": models})
     except Exception as e:
-        return JSONResponse({"ok": False, "error": str(e), "models": []}, status_code=500)
+        # Ollama kapalıysa bile ARGOS'u göstereceğiz
+        return JSONResponse({"ok": True, "models": models, "warning": str(e)})
 
 
 def _run_translate(in_path: str, out_path: str, src: str, tgt: str, model: str, pdf_mode: str, task_id: str) -> None:
@@ -946,7 +1037,7 @@ def main():
     ap.add_argument("--out", dest="out_path", required=False)
     ap.add_argument("--src", default="fr")
     ap.add_argument("--tgt", default="en")
-    ap.add_argument("--model", default="qwen2.5:7b")
+    ap.add_argument("--model", default="ARGOS")
     ap.add_argument("--pdf_mode", choices=["stable", "ocr", "ocr_doctr"], default="stable")
     ap.add_argument("--serve", action="store_true")
     args = ap.parse_args()
@@ -957,7 +1048,7 @@ def main():
         return
 
     if not args.in_path or not args.out_path:
-        print("CLI kullanım: --in input.pdf --out out.pdf --src xx --tgt yy [--model name] [--pdf_mode stable|ocr|ocr_doctr]")
+        print("CLI kullanım: --in input.pdf --out out.pdf --src xx --tgt yy [--model ARGOS|ollama-model-adi] [--pdf_mode stable|ocr|ocr_doctr]")
         sys.exit(2)
 
     translate_pdf(args.in_path, args.out_path, args.src, args.tgt, model=args.model, pdf_mode=args.pdf_mode)
