@@ -761,7 +761,8 @@ def ui() -> HTMLResponse:
             <option value="stable">stable (span)</option>
             <option value="ocr">ocr (Paddle)</option>
             <option value="ocr_doctr" selected>ocr_doctr (PyTorch)</option>
-          </select>
+            <option value="ocr_rebuild">ocr_rebuild (Paddle+ReportLab rebuild)</option>
+</select>
         </div>
         <div>
           <label>Model</label>
