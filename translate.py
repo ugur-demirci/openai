@@ -257,27 +257,35 @@ def _extract_spans(page: fitz.Page) -> List[dict]:
 
 
 def _stable_translate_page(page: fitz.Page, model: str, src: str, tgt: str) -> None:
-    spans = _extract_spans(page)
-    # Span yok/az ise docTR'a düş
-    if (not spans) or (sum(len(s.get("text","")) for s in spans) < 20) or (len(spans) < 3):
-        task_log(getattr(threading.current_thread(), 'task_id', 'NA'), "stable: low span density -> fallback to docTR")
-        _ocr_doctr_translate_page(page, model, src, tgt)
-        return
-    # Argos'ta src=auto için örnek metin (ilk spanlardan)
-    sample = " ".join(s["text"] for s in spans[:8])[:2000]
-    translations = _translate_batch([s["text"] for s in spans], model, src, tgt, sample_text=sample)
-    for s in spans:
-        page.add_redact_annot(fitz.Rect(s["bbox"]), fill=None)
-    page.apply_redactions()
-    for s, txt in zip(spans, translations):
-        rect = fitz.Rect(s["bbox"])
-        fontfile, is_file = _choose_fontfile(s["font"])
-        if is_file:
-            page.insert_textbox(rect, txt, fontfile=fontfile, fontsize=s["size"], color=s["color"])
-        else:
-            page.insert_textbox(rect, txt, fontname=fontfile, fontsize=s["size"], color=s["color"])
 
-# ------------------------------------------------------------
+    spans = _extract_spans(page)
+
+    if not spans:
+
+        spans = _extract_spans_textpage(page)
+
+        if not spans:
+
+            task_log(getattr(threading.current_thread(), "task_id", "NA"), "stable: low span density -> fallback to docTR")
+
+            _ocr_doctr_translate_page(page, model, src, tgt)
+
+            return
+
+    sample = " ".join(s["text"] for s in spans[:8])[:2000]
+
+    translations = _translate_batch([s["text"] for s in spans], model, src, tgt, sample_text=sample)
+
+    for s in spans:
+
+        page.add_redact_annot(fitz.Rect(s["bbox"]), fill=None)
+
+    for s, t in zip(spans, translations):
+
+        rect = fitz.Rect(s["bbox"])
+
+        page.insert_textbox(rect, t, fontsize=float(s.get("size", 10)), fontname=s.get("font", "NotoSans"), color=s.get("color", [0, 0, 0]), align=0)
+
 # OCR modları
 # ------------------------------------------------------------
 
@@ -1362,4 +1370,29 @@ def _translate_batch(texts, model, src, tgt, sample_text=None):
                     out.append(t)
             return out
     except Exception:
-        return [t for t in texts]
+        return [t for t in texts]# -------- stable mode fallback span extractor (PyMuPDF textpage) --------
+def _extract_spans_textpage(page: fitz.Page) -> list[dict]:
+    spans = []
+    try:
+        tp = page.get_textpage()
+        # extractBLOCKS: (x0, y0, x1, y1, "text", block_no, block_type, ...)
+        for blk in tp.extractBLOCKS() or []:
+            if len(blk) < 5: 
+                continue
+            x0, y0, x1, y1, txt = blk[0], blk[1], blk[2], blk[3], blk[4]
+            if not txt:
+                continue
+            for line in txt.splitlines():
+                t = line.strip()
+                if not t:
+                    continue
+                spans.append({
+                    "text": t,
+                    "bbox": [float(x0), float(y0), float(x1), float(y1)],
+                    "size": 10.0,
+                    "color": [0, 0, 0],
+                    "font": "Helvetica",
+                })
+    except Exception:
+        pass
+    return spans
