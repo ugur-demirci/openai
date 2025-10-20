@@ -268,6 +268,9 @@ def _stable_translate_page(page: fitz.Page, model: str, src: str, tgt: str) -> N
     sample = " ".join(s.get("text","") for s in spans[:8])[:2000]
     translations = _translate_batch([s.get("text","") for s in spans], model, src, tgt, sample_text=sample)
 
+    # çizim stabilitesi için span'ları satır (
+    # y0'ya göre, sonra x0'a göre sırala
+    spans = sorted(spans, key=lambda s: (round(fitz.Rect(s['bbox']).y0, 1), fitz.Rect(s['bbox']).x0))
     # 3) orijinal metni beyazlayıp kaldır (redact) ve uygula
     for s in spans:
         try:
@@ -1413,7 +1416,7 @@ def _wrap_text_by_width(text: str, fontname: str, fontsize: float, max_w: float)
         lines.append(cur)
     return lines
 
-def _shrink_lines_to_fit(lines: list[str], fontname: str, fontsize: float, max_w: float, max_h: float, leading_ratio: float = 1.15, min_size: float = 6.0):
+def _shrink_lines_to_fit(lines: list[str], fontname: str, fontsize: float, max_w: float, max_h: float, leading_ratio: float = 1.30, min_size: float = 6.0):
     import fitz
     try:
         fontname = str(fontname or "Helvetica")
