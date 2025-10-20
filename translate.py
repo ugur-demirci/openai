@@ -254,54 +254,61 @@ def _extract_spans(page: fitz.Page) -> List[dict]:
     return spans
 
 def _stable_translate_page(page: fitz.Page, model: str, src: str, tgt: str) -> None:
-
+    # 1) span çıkarımı (dijital PDF için)
     spans = _extract_spans(page)
-
     if not spans:
-
         spans = _extract_spans_textpage(page)
-
         if not spans:
-
-            task_log(getattr(threading.current_thread(), "task_id", "NA"), "stable: low span density -> fallback to docTR")
-
+            task_log(getattr(threading.current_thread(), "task_id", "NA"),
+                     "stable: low span density -> fallback to docTR")
             _ocr_doctr_translate_page(page, model, src, tgt)
-
             return
 
-    sample = " ".join(s["text"] for s in spans[:8])[:2000]
+    # 2) örnek metin ve toplu çeviri
+    sample = " ".join(s.get("text","") for s in spans[:8])[:2000]
+    translations = _translate_batch([s.get("text","") for s in spans], model, src, tgt, sample_text=sample)
 
-    translations = _translate_batch([s["text"] for s in spans], model, src, tgt, sample_text=sample)
-
+    # 3) orijinal metni beyazlayıp kaldır (redact) ve uygula
     for s in spans:
-        page.add_redact_annot(fitz.Rect(s["bbox"]), fill=(1,1,1))
-    page.apply_redactions()
-for s, t in zip(spans, translations):
+        try:
+            page.add_redact_annot(fitz.Rect(s["bbox"]), fill=(1,1,1))
+        except Exception:
+            pass
+    try:
+        page.apply_redactions()
+    except Exception:
+        pass
+
+    # 4) her kutuya sarma + shrink ile satır satır yaz
+    for s, t in zip(spans, translations):
         rect = fitz.Rect(s["bbox"])
-        # eğer daha önce yazılmış bir bölgeyle ciddi çakışma varsa atla
-        # orijinal stil parametreleri:
         fw = float(s.get("size", 10))
         fn = str(s.get("font", "NotoSans") or "NotoSans")
         cr = s.get("color", [0, 0, 0])
-        # kutu sınırları
-        max_w = rect.width
-        max_h = rect.height
-        # kelime sarma + yükseklik uyumu
+
+        # küçük iç boşluk
+        P = max(1.0, fw * 0.3)
+        max_w = max(1.0, rect.width - 2*P)
+        max_h = max(1.0, rect.height)
+
+        # kelime sarma + yükseklik uyumu (ölçüm Helvetica ile)
         lines = _wrap_text_by_width(t, fn, fw, max_w)
         fw, leading = _shrink_lines_to_fit(lines, fn, fw, max_w, max_h)
-        wrapped = "\n".join(lines)
-        # sarılmış metni kutuya yaz
+        # final fontla tekrar sar
+        lines = _wrap_text_by_width(t, fn, fw, max_w)
+
+        # satır satır çizim
         y = rect.y0 + fw * 0.9
         for ln in lines:
             if y > rect.y1:
                 break
             try:
-                page.insert_text((rect.x0, y), ln, fontsize=fw, fontname=fn, color=cr)
+                page.insert_text((rect.x0 + P, y), ln, fontsize=fw, fontname=fn, color=cr)
             except Exception:
-                page.insert_text((rect.x0, y), ln, fontsize=fw, fontname="Helvetica", color=cr)
+                page.insert_text((rect.x0 + P, y), ln, fontsize=fw, fontname="Helvetica", color=cr)
             y += leading
-        # bu span için yazım bitti; bölgeyi işaretle
-        drawn_regions.append(rect)
+
+
 # OCR modları
 # ------------------------------------------------------------
 
