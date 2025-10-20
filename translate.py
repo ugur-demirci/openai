@@ -338,7 +338,13 @@ def _ocr_translate_page(page: fitz.Page, model: str, src: str, tgt: str) -> None
             return
         task_log(getattr(threading.current_thread(), 'task_id', 'NA'), f"PaddleOCR: lines={count_lines}, to_translate={len(texts)}")
         sample = " ".join(texts[:40])[:2000]
+        t_tr0 = time.time()
+
+        if task_id: task_log(task_id, f"OCR_REBUILD translate batch: {len(texts)} items on page {page_index}")
+
         translations = _translate_batch(texts, model, src, tgt, sample_text=sample)
+
+        if task_id: task_log(task_id, f"OCR_REBUILD translate done in {time.time()-t_tr0:.2f}s on page {page_index}")
         for bb, txt in zip(boxes, translations):
             rect = fitz.Rect(bb)
             fontsize = max(10, min(28, rect.height))
@@ -1000,7 +1006,7 @@ def main():
     ap.add_argument("--src", default="fr")
     ap.add_argument("--tgt", default="en")
     ap.add_argument("--model", default="ARGOS")
-    ap.add_argument("--pdf_mode", choices=["stable", "ocr", "ocr_doctr"], default="stable")
+    ap.add_argument("--pdf_mode", choices=["stable", "ocr", "ocr_doctr", "ocr_rebuild"], default="stable")
     ap.add_argument("--serve", action="store_true")
     args = ap.parse_args()
 
