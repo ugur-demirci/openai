@@ -14,6 +14,34 @@ translate.py (v0.4.1-argos-fix)
 - Tunables (env): OCR_SCALE, BATCH_SIZE, OLLAMA_TIMEOUT
 """
 from __future__ import annotations
+# === offline-safe OCR language normalization & PaddleOCR wrapper ===
+import os
+try:
+    from paddleocr import PaddleOCR as _RealPaddleOCR  # noqa: E402
+except Exception:
+    _RealPaddleOCR = None
+
+def _normalize_ocr_lang(code):
+    # Prefer 'latin' (TR dahil latin alfabe); yoksa 'en'
+    pref = os.environ.get("PADDLE_OCR_PREF", "latin")
+    fallback = "en"
+    if code is None or str(code).lower() in ("auto", "tr", "tur", "none", ""):
+        return pref
+    c = str(code).lower()
+    if c in ("en","english","latin","ch","korean","japan","chinese_cht","ta","te","ka","arabic","cyrillic","devanagari"):
+        return c
+    return pref if pref in ("latin","en") else fallback
+
+if _RealPaddleOCR is not None:
+    class PaddleOCR(_RealPaddleOCR):  # type: ignore
+        def __init__(self, *args, **kwargs):
+            lang = kwargs.get("lang")
+            lang = _normalize_ocr_lang(lang)
+            kwargs["lang"] = lang
+            super().__init__(*args, **kwargs)
+# === end wrapper ===
+
+
 
 import argparse
 import os
@@ -252,8 +280,8 @@ def _stable_translate_page(page: fitz.Page, model: str, src: str, tgt: str) -> N
     spans = _extract_spans(page)
     # Span yok/az ise docTR'a düş
     if (not spans) or (sum(len(s.get("text","")) for s in spans) < 20) or (len(spans) < 3):
-        task_log(getattr(threading.current_thread(), 'task_id', 'NA'), "stable: low span density -> fallback to docTR")
-        _ocr_doctr_translate_page(page, model, src, tgt)
+        task_log(getattr(threading.current_thread(), 'task_id', 'NA'), "stable: low span density -> fallback to PaddleOCR")
+        _ocr_translate_page(page, model, src, tgt)
         return
     # Argos'ta src=auto için örnek metin (ilk spanlardan)
     sample = " ".join(s["text"] for s in spans[:8])[:2000]
@@ -377,7 +405,8 @@ def _get_doctr():
 
 def _ocr_doctr_translate_page(page: fitz.Page, model: str, src: str, tgt: str) -> None:
     if DocumentFile is None:
-        raise RuntimeError("docTR DocumentFile kullanılamıyor (import başarısız).")
+        task_log(getattr(threading.current_thread(), 'task_id', 'NA'), "docTR not available -> fallback to PaddleOCR")
+        return _ocr_translate_page(page, model, src, tgt)
     png_path, _ = _page_to_png(page, scale=max(OCR_SCALE, 3.0))
     try:
         pred = _get_doctr()
@@ -449,7 +478,7 @@ def translate_pdf(in_path: str, out_path: str, src: str, tgt: str, *, model: str
         elif pdf_mode == "ocr":
             _ocr_translate_page(page, model, src, tgt)
         elif pdf_mode == "ocr_doctr":
-            _ocr_doctr_translate_page(page, model, src, tgt)
+            _ocr_translate_page(page, model, src, tgt)
         elif pdf_mode == "ocr_rebuild":
             doc.close()
             translate_pdf_rebuild(in_path, out_path, src, tgt, model=model, task_id=task_id)
