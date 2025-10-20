@@ -126,11 +126,9 @@ def _choose_fontfile(span_fontname: str) -> Tuple[str, bool]:
         return reg, True
     return 'helv', False  # Helvetica yerleşik ad
 
-
 def _rgb_from_int(i: int) -> Tuple[float, float, float]:
     r, g, b = ((i >> 16) & 255), ((i >> 8) & 255), (i & 255)
     return (r/255.0, g/255.0, b/255.0)
-
 
 def detect_lang(t: str) -> Optional[str]:
     if not _FT or not t.strip():
@@ -255,7 +253,6 @@ def _extract_spans(page: fitz.Page) -> List[dict]:
                     })
     return spans
 
-
 def _stable_translate_page(page: fitz.Page, model: str, src: str, tgt: str) -> None:
 
     spans = _extract_spans(page)
@@ -279,12 +276,32 @@ def _stable_translate_page(page: fitz.Page, model: str, src: str, tgt: str) -> N
     for s in spans:
         page.add_redact_annot(fitz.Rect(s["bbox"]), fill=(1,1,1))
     page.apply_redactions()
-    for s, t in zip(spans, translations):
-
+for s, t in zip(spans, translations):
         rect = fitz.Rect(s["bbox"])
-
-        page.insert_textbox(rect, t, fontsize=float(s.get("size", 10)), fontname=s.get("font", "NotoSans"), color=s.get("color", [0, 0, 0]), align=0)
-
+        # eğer daha önce yazılmış bir bölgeyle ciddi çakışma varsa atla
+        # orijinal stil parametreleri:
+        fw = float(s.get("size", 10))
+        fn = str(s.get("font", "NotoSans") or "NotoSans")
+        cr = s.get("color", [0, 0, 0])
+        # kutu sınırları
+        max_w = rect.width
+        max_h = rect.height
+        # kelime sarma + yükseklik uyumu
+        lines = _wrap_text_by_width(t, fn, fw, max_w)
+        fw, leading = _shrink_lines_to_fit(lines, fn, fw, max_w, max_h)
+        wrapped = "\n".join(lines)
+        # sarılmış metni kutuya yaz
+        y = rect.y0 + fw * 0.9
+        for ln in lines:
+            if y > rect.y1:
+                break
+            try:
+                page.insert_text((rect.x0, y), ln, fontsize=fw, fontname=fn, color=cr)
+            except Exception:
+                page.insert_text((rect.x0, y), ln, fontsize=fw, fontname="Helvetica", color=cr)
+            y += leading
+        # bu span için yazım bitti; bölgeyi işaretle
+        drawn_regions.append(rect)
 # OCR modları
 # ------------------------------------------------------------
 
@@ -317,7 +334,6 @@ def _get_ocr(lang: str = 'en'):
         )
     return _OCR_INSTANCE
 
-
 def _page_to_png(page: fitz.Page, scale: Optional[float] = None) -> Tuple[str, float]:
     import tempfile
     s = scale if (isinstance(scale, (int, float)) and (scale or 0) > 0) else 2.0
@@ -328,7 +344,6 @@ def _page_to_png(page: fitz.Page, scale: Optional[float] = None) -> Tuple[str, f
     tmp_png = tmp.name
     tmp.close()
     return tmp_png, s
-
 
 def _ocr_translate_page(page: fitz.Page, model: str, src: str, tgt: str) -> None:
     ocr_lang = _src_to_paddle_lang(src)
@@ -382,7 +397,6 @@ def _get_doctr():
             raise RuntimeError("docTR ocr_predictor() None döndü.")
         _DOCTR_PRED = pred.to(device)
     return _DOCTR_PRED
-
 
 def _ocr_doctr_translate_page(page: fitz.Page, model: str, src: str, tgt: str) -> None:
     if DocumentFile is None:
@@ -487,11 +501,9 @@ def translate_pdf(in_path: str, out_path: str, src: str, tgt: str, *, model: str
 TASKS: dict[str, dict] = {}
 _TASK_LOCK = threading.Lock()
 
-
 def _now_iso() -> str:
     from datetime import datetime
     return datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
-
 
 def _gpu_snapshot():
     try:
@@ -513,7 +525,6 @@ def _gpu_snapshot():
         pass
     return None
 
-
 def _cpu_snapshot():
     try:
         if psutil:
@@ -521,7 +532,6 @@ def _cpu_snapshot():
     except Exception:
         pass
     return None
-
 
 def _task_write_snap(task_id: str) -> None:
     with _TASK_LOCK:
@@ -533,7 +543,6 @@ def _task_write_snap(task_id: str) -> None:
                 json.dump(d, f, ensure_ascii=False, indent=2)
         except Exception:
             pass
-
 
 def task_init(task_id: str, meta: dict) -> dict:
     d = {
@@ -566,7 +575,6 @@ def task_init(task_id: str, meta: dict) -> dict:
     _task_write_snap(task_id)
     return d
 
-
 def task_log(task_id: str, msg: str) -> None:
     line = f"[{_now_iso()}] {msg}\n"
     try:
@@ -574,7 +582,6 @@ def task_log(task_id: str, msg: str) -> None:
             f.write(line)
     except Exception:
         pass
-
 
 def task_update(task_id: str, **kw) -> None:
     with _TASK_LOCK:
@@ -587,11 +594,9 @@ def task_update(task_id: str, **kw) -> None:
         d["gpu"] = _gpu_snapshot()
     _task_write_snap(task_id)
 
-
 def task_error(task_id: str, err: Exception) -> None:
     task_update(task_id, status="error", error=str(err))
     task_log(task_id, f"ERROR: {err}")
-
 
 def task_done(task_id: str, output_path: str) -> None:
     task_update(task_id, status="done", progress=100.0, output_path=output_path)
@@ -602,7 +607,6 @@ def task_done(task_id: str, output_path: str) -> None:
 # ------------------------------------------------------------
 
 app = FastAPI(title="offlineAI translate-api", version="v0.4.1-argos-fix")
-
 
 @app.post("/translate")
 async def api_translate(
@@ -639,7 +643,6 @@ async def api_translate(
         task_error(task_id, e)
         return JSONResponse({"ok": False, "task_id": task_id, "error": str(e)}, status_code=500)
 
-
 @app.get("/metrics")
 async def metrics():
     info: dict = {"cpu": None, "gpu": None}
@@ -668,7 +671,6 @@ async def metrics():
             info["gpu"] = None
     return info
 
-
 @app.get("/status/{task_id}")
 def get_status(task_id: str):
     d = None
@@ -683,7 +685,6 @@ def get_status(task_id: str):
     if not d:
         return JSONResponse({"ok": False, "error": "task_id not found"}, status_code=404)
     return JSONResponse({"ok": True, "status": d})
-
 
 @app.get("/logs/{task_id}")
 def get_logs(task_id: str, tail: int = 200):
@@ -700,7 +701,6 @@ def get_logs(task_id: str, tail: int = 200):
         return JSONResponse({"ok": True, "log": "".join(lines[-tail:])})
     except Exception as e:
         return JSONResponse({"ok": False, "error": str(e)}, status_code=500)
-
 
 @app.get("/")
 def ui() -> HTMLResponse:
@@ -918,7 +918,6 @@ window.addEventListener('load', ()=>{ loadModels(); pollMetrics(); mpoll = setIn
         """
     )
 
-
 @app.get("/download/{task_id}")
 def download(task_id: str):
     with _TASK_LOCK:
@@ -971,7 +970,6 @@ def download(task_id: str):
 
     return FileResponse(os.path.abspath(out_path), media_type="application/pdf", filename=dl_name)
 
-
 @app.get("/models")
 def list_models():
     """ARGOS'u sabit döndür + Ollama tag'lerini ekle. 'Ollama Yenile' bu uca bakıyor."""
@@ -990,7 +988,6 @@ def list_models():
     except Exception as e:
         # Ollama kapalıysa bile ARGOS'u göstereceğiz
         return JSONResponse({"ok": True, "models": models, "warning": str(e)})
-
 
 def _run_translate(in_path: str, out_path: str, src: str, tgt: str, model: str, pdf_mode: str, task_id: str, rebuild_output: bool = False) -> None:
     try:
@@ -1030,10 +1027,8 @@ def main():
     translate_pdf(args.in_path, args.out_path, args.src, args.tgt, model=args.model, pdf_mode=args.pdf_mode)
     print(f"OK -> {args.out_path}")
 
-
 if __name__ == "__main__":
     main()
-
 
 # ------------------------------------------------------------
 # OCR_REBUILD: PaddleOCR + ReportLab ile sayfayı baştan çiz
@@ -1135,7 +1130,6 @@ def translate_pdf_rebuild(in_path: str, out_path: str, src: str, tgt: str, *, mo
                     size *= 0.92
                 return max(min_size, size), max(min_size, size) * leading_ratio
 
-
             # draw original page image as background
             try:
                 c.drawImage(png_path, 0, 0, width=pw, height=ph, preserveAspectRatio=False, mask=None)
@@ -1195,7 +1189,6 @@ def _render_empty_pdf(pw: float, ph: float) -> str:
     c.showPage(); c.save()
     return tmp_path
 
-
 # ------------------------------------------------------------
 # Fallback batch translator for OCR_REBUILD
 # ------------------------------------------------------------
@@ -1223,8 +1216,6 @@ def _force_argos_cuda():
     except Exception as e:
         print(f"[ARGOSDBG] import ctranslate2 failed: {e}", flush=True)
     return True
-
-
 
 # --- ARGOS (CT2/CUDA) helper: translator injection + reuse ---
 _ARGOS_TR_CACHE = {}  # key: (src_code, tgt_code) -> CachedTranslation
@@ -1296,7 +1287,6 @@ def _argos_get_translation_cuda(src: str, tgt: str):
 
     _ARGOS_TR_CACHE[k] = tr
     return tr
-
 
 def _translate_batch(texts, model, src, tgt, sample_text=None):
     out = []
@@ -1395,3 +1385,44 @@ def _extract_spans_textpage(page: fitz.Page) -> list[dict]:
     except Exception:
         pass
     return spans
+
+# ===== stable(span) helpers: wrap + shrink-to-fit =====
+def _wrap_text_by_width(text: str, fontname: str, fontsize: float, max_w: float) -> list[str]:
+    import fitz
+    lines = []
+    for para in (text or "").splitlines():
+        words = para.split()
+        if not words:
+            lines.append("")
+            continue
+        cur = words[0]
+        for w in words[1:]:
+            test = cur + " " + w
+            if fitz.get_text_length(test, fontname="Helvetica", fontsize=fontsize) <= max_w:
+                cur = test
+            else:
+                lines.append(cur)
+                cur = w
+        lines.append(cur)
+    return lines
+
+def _shrink_lines_to_fit(lines: list[str], fontname: str, fontsize: float, max_w: float, max_h: float, leading_ratio: float = 1.15, min_size: float = 6.0):
+    import fitz
+    try:
+        fontname = str(fontname or "Helvetica")
+    except Exception:
+        fontname = "Helvetica"
+    try:
+        fontsize = float(fontsize or 10.0)
+    except Exception:
+        fontsize = 10.0
+    import fitz
+    size = float(fontsize)
+    while size > min_size:
+        too_wide = any(fitz.get_text_length(ln, fontname="Helvetica", fontsize=size) > max_w for ln in lines if ln)
+        leading = size * leading_ratio
+        need_h = leading * max(1, len(lines))
+        if (not too_wide) and (need_h <= max_h):
+            return size, leading
+        size *= 0.92
+    return max(min_size, size), max(min_size, size) * leading_ratio
