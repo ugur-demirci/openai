@@ -1142,48 +1142,113 @@ def _render_empty_pdf(pw: float, ph: float) -> str:
 # ------------------------------------------------------------
 # Fallback batch translator for OCR_REBUILD
 # ------------------------------------------------------------
+
 def _translate_batch(texts, model, src, tgt, sample_text=None):
-    out = []
+    """
+    ARGOS: birebir çağrı (lokal, hızlı)
+    OLLAMA: metinleri numaralandırıp gruplar halinde TEK istekle çevirir, sonra geri eşler.
+    Bu sayede yüzlerce HTTP çağrısı yerine her grup için 1 çağrı yapılır.
+    """
     try:
         if (model or "").strip().upper() == "ARGOS":
+            out = []
             try:
                 import argostranslate.package, argostranslate.translate
             except Exception:
                 return [t for t in texts]
-            for idx, t in enumerate(texts):
-                if idx >= 20: break
+            for t in texts:
                 try:
                     out.append(argostranslate.translate.translate(t, src, tgt))
                 except Exception:
                     out.append(t)
             return out
-        else:
-            import requests, json
-            url = "http://127.0.0.1:11434/api/generate"
-            headers = {"Content-Type":"application/json"}
-            prompt_tpl = (
-                "You are a professional translator. Preserve meaning, tone, and style.\\n"
-                "Return only the translation without commentary.\\n"
-                "Source language: {src}\\n"
-                "Target language: {tgt}\\n"
-                "Text:\\n<<<\\n{txt}\\n>>>"
+
+        # ---- OLLAMA (tek/az çağrı) ----
+        import requests, json, math
+
+        base_url = "http://127.0.0.1:11434/api/generate"
+        headers = {"Content-Type": "application/json"}
+
+        # Çok uzun PDF'lerde token sınırı için küçük gruplar kullan
+        CHUNK = 32  # gerekirse 24/16'ya düşürülebilir
+        out = [None] * len(texts)
+
+        def build_prompt(items):
+            # items: [(idx, text), ...]
+            numbered = "\n".join([f"{i+1}) {t}" for i, t in items])
+            return (
+                "You are a professional translator. Preserve meaning, tone, and style.\n"
+                "Return ONLY the translations, one per line, keeping the SAME numbering.\n"
+                f"Source language: {src}\n"
+                f"Target language: {tgt}\n"
+                "Text:\n<<<\n"
+                f"{numbered}\n"
+                ">>>"
             )
-            for t in texts:
-                payload = {
-                    "model": model,
-                    "prompt": prompt_tpl.format(src=src, tgt=tgt, txt=t),
-                    "stream": False,
-                    "options": {"temperature": 0.2}
-                }
-                try:
-                    r = requests.post(url, headers=headers, data=json.dumps(payload), timeout=20)
-                    if r.ok:
-                        js = r.json()
-                        out.append((js.get("response") or "").strip() or t)
-                    else:
-                        out.append(t)
-                except Exception:
-                    out.append(t)
-            return out
+
+        for start in range(0, len(texts), CHUNK):
+            group = list(enumerate(texts[start:start+CHUNK], start=start))
+            # boş satırlar gereksiz yer kaplamasın
+            cleaned = [(i, (t or "").strip()) for i,t in group if (t or "").strip() != ""]
+            if not cleaned:
+                continue
+
+            prompt = build_prompt([(i, t) for i, t in cleaned])
+
+            payload = {
+                "model": model,
+                "prompt": prompt,
+                "stream": False,
+                "options": {"temperature": 0.2}
+            }
+
+            try:
+                r = requests.post(base_url, headers=headers, data=json.dumps(payload), timeout=60)
+                if not r.ok:
+                    # başarısızsa grup için fall-back: aynen geri koy
+                    for i, t in cleaned:
+                        out[i] = t
+                    continue
+
+                resp = (r.json().get("response") or "").strip()
+                # Beklenen çıktı:
+                # 1) ...
+                # 2) ...
+                # satır başında "N)" ile ayrılmış olmalı; değilse satır-satır dağıt
+                lines = [ln.strip() for ln in resp.splitlines() if ln.strip()]
+
+                # Basit ayrıştırıcı: "N) çeviri"
+                parsed = {}
+                for ln in lines:
+                    # 1) ...  /  12) ...
+                    if ")" in ln:
+                        head, rest = ln.split(")", 1)
+                        try:
+                            n = int(head.strip())
+                            parsed[n-1] = rest.strip()
+                        except Exception:
+                            pass
+
+                # Eğer numaralı ayrışmadıysa, sırayla eşle
+                if not parsed:
+                    for k,(i, _t) in enumerate(cleaned):
+                        out[i] = (lines[k] if k < len(lines) else _t)
+
+                else:
+                    # numaralı olanları yerleştir
+                    for k,(i, _t) in enumerate(cleaned):
+                        out[i] = parsed.get(k, _t)
+
+            except Exception:
+                # grup hatasında, fall-back
+                for i, t in cleaned:
+                    out[i] = t
+
+        # Boşta kalan None'lar varsa orijinali ver
+        for i,v in enumerate(out):
+            if v is None:
+                out[i] = texts[i]
+        return out
+
     except Exception:
         return [t for t in texts]
