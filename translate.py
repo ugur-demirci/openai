@@ -1218,8 +1218,109 @@ def _force_argos_cuda():
     return True
 
 
+
+# --- ARGOS (CT2/CUDA) helper: translator injection + reuse ---
+_ARGOS_TR_CACHE = {}  # key: (src_code, tgt_code) -> CachedTranslation
+
+def _argos_get_translation_cuda(src: str, tgt: str):
+    """
+    Argos'un Translation nesnesini döndürürken, alttaki PackageTranslation.translator
+    alanına CTranslate2.Translator(device="cuda", compute_type="float16") enjekte eder.
+    Sonraki çağrılar aynı objeyi yeniden kullanır.
+    """
+    try:
+        import argostranslate.translate as at
+    except Exception:
+        return None
+
+    # ortamı garantiye al
+    try:
+        _force_argos_cuda()
+    except Exception:
+        pass
+
+    # normalize
+    src = (src or "").lower()
+    tgt = (tgt or "").lower()
+
+    # cache?
+    k = (src, tgt)
+    if k in _ARGOS_TR_CACHE:
+        return _ARGOS_TR_CACHE[k]
+
+    langs = at.get_installed_languages()
+    s = next((l for l in langs if l.code == src), None)
+    t = next((l for l in langs if l.code == tgt), None)
+    if not s or not t:
+        return None
+
+    tr = s.get_translation(t)  # CachedTranslation
+    underlying = getattr(tr, "underlying", None)  # PackageTranslation
+    if underlying is None:
+        _ARGOS_TR_CACHE[k] = tr
+        return tr
+
+    if getattr(underlying, "translator", None) is not None:
+        _ARGOS_TR_CACHE[k] = tr
+        return tr
+
+    # Paketin model dizinini bul (Argos 1.9.x)
+    pkg = getattr(underlying, "pkg", None)
+    model_dir = None
+    for cand in ("package_path", "install_path", "path"):
+        if pkg is not None and hasattr(pkg, cand):
+            try:
+                pth = getattr(pkg, cand)
+                if pth:
+                    model_dir = str(pth)
+                    break
+            except Exception:
+                pass
+
+    # CTranslate2 translator oluştur ve enjekte et
+    try:
+        import ctranslate2 as ct
+        if model_dir:
+            translator = ct.Translator(model_dir, device="cuda", compute_type="float16")
+            setattr(underlying, "translator", translator)
+    except Exception:
+        # sessiz düş
+        pass
+
+    _ARGOS_TR_CACHE[k] = tr
+    return tr
+
+
 def _translate_batch(texts, model, src, tgt, sample_text=None):
     out = []
+
+    # --- ARGOS (GPU via CTranslate2) early-return path ---
+    if (model or "").strip().upper() == "ARGOS":
+        out = []
+        tr_obj = _argos_get_translation_cuda(src, tgt)
+        if tr_obj is None:
+            try:
+                import argostranslate.translate as at
+                for _t in texts:
+                    try:
+                        out.append(at.translate(_t, src, tgt))
+                    except Exception:
+                        out.append(_t)
+                return out
+            except Exception:
+                return [t for t in texts]
+
+        # mini-batch: ardışık çağrılar aynı CT2 translator'ı paylaşır
+        import os
+        bs = max(1, min(int(os.environ.get("BATCH_SIZE", "12")), 64))
+        for i in range(0, len(texts), bs):
+            chunk = texts[i:i+bs]
+            for _t in chunk:
+                try:
+                    out.append(tr_obj.translate(_t))
+                except Exception:
+                    out.append(_t)
+        return out
     try:
         if (model or "").strip().upper() == "ARGOS":
             try:
