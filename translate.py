@@ -1144,7 +1144,8 @@ def _translate_batch(texts, model, src, tgt, sample_text=None):
                 import argostranslate.package, argostranslate.translate
             except Exception:
                 return [t for t in texts]
-            for t in texts:
+            for idx, t in enumerate(texts):
+                if idx >= 20: break
                 try:
                     out.append(argostranslate.translate.translate(t, src, tgt))
                 except Exception:
@@ -1169,7 +1170,7 @@ def _translate_batch(texts, model, src, tgt, sample_text=None):
                     "options": {"temperature": 0.2}
                 }
                 try:
-                    r = requests.post(url, headers=headers, data=json.dumps(payload), timeout=180)
+                    r = requests.post(url, headers=headers, data=json.dumps(payload), timeout=20)
                     if r.ok:
                         js = r.json()
                         out.append((js.get("response") or "").strip() or t)
