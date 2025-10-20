@@ -14,37 +14,17 @@ translate.py (v0.4.1-argos-fix)
 - Tunables (env): OCR_SCALE, BATCH_SIZE, OLLAMA_TIMEOUT
 """
 from __future__ import annotations
-# === offline-safe OCR language normalization & PaddleOCR wrapper ===
-import os
-try:
-    from paddleocr import PaddleOCR as _RealPaddleOCR  # noqa: E402
-except Exception:
-    _RealPaddleOCR = None
-
-def _normalize_ocr_lang(code):
-    # Prefer 'latin' (TR dahil latin alfabe); yoksa 'en'
-    pref = os.environ.get("PADDLE_OCR_PREF", "latin")
-    fallback = "en"
-    if code is None or str(code).lower() in ("auto", "tr", "tur", "none", ""):
-        return pref
-    c = str(code).lower()
-    if c in ("en","english","latin","ch","korean","japan","chinese_cht","ta","te","ka","arabic","cyrillic","devanagari"):
-        return c
-    return pref if pref in ("latin","en") else fallback
-
-if _RealPaddleOCR is not None:
-    class PaddleOCR(_RealPaddleOCR):  # type: ignore
-        def __init__(self, *args, **kwargs):
-            lang = kwargs.get("lang")
-            lang = _normalize_ocr_lang(lang)
-            kwargs["lang"] = lang
-            super().__init__(*args, **kwargs)
-# === end wrapper ===
-
-
 
 import argparse
 import os
+# --- force ArgosTranslate to use CUDA (CTranslate2) ---
+try:
+    # only set if not explicitly provided
+    if os.environ.get("ARGOS_DEVICE_TYPE") not in ("cuda", "auto"):
+        os.environ["ARGOS_DEVICE_TYPE"] = "cuda"
+except Exception:
+    pass
+
 import sys
 import time
 import uuid
@@ -280,8 +260,8 @@ def _stable_translate_page(page: fitz.Page, model: str, src: str, tgt: str) -> N
     spans = _extract_spans(page)
     # Span yok/az ise docTR'a düş
     if (not spans) or (sum(len(s.get("text","")) for s in spans) < 20) or (len(spans) < 3):
-        task_log(getattr(threading.current_thread(), 'task_id', 'NA'), "stable: low span density -> fallback to PaddleOCR")
-        _ocr_translate_page(page, model, src, tgt)
+        task_log(getattr(threading.current_thread(), 'task_id', 'NA'), "stable: low span density -> fallback to docTR")
+        _ocr_doctr_translate_page(page, model, src, tgt)
         return
     # Argos'ta src=auto için örnek metin (ilk spanlardan)
     sample = " ".join(s["text"] for s in spans[:8])[:2000]
@@ -366,13 +346,7 @@ def _ocr_translate_page(page: fitz.Page, model: str, src: str, tgt: str) -> None
             return
         task_log(getattr(threading.current_thread(), 'task_id', 'NA'), f"PaddleOCR: lines={count_lines}, to_translate={len(texts)}")
         sample = " ".join(texts[:40])[:2000]
-        t_tr0 = time.time()
-
-        if task_id: task_log(task_id, f"OCR_REBUILD translate batch: {len(texts)} items on page {page_index}")
-
         translations = _translate_batch(texts, model, src, tgt, sample_text=sample)
-
-        if task_id: task_log(task_id, f"OCR_REBUILD translate done in {time.time()-t_tr0:.2f}s on page {page_index}")
         for bb, txt in zip(boxes, translations):
             rect = fitz.Rect(bb)
             fontsize = max(10, min(28, rect.height))
@@ -405,8 +379,7 @@ def _get_doctr():
 
 def _ocr_doctr_translate_page(page: fitz.Page, model: str, src: str, tgt: str) -> None:
     if DocumentFile is None:
-        task_log(getattr(threading.current_thread(), 'task_id', 'NA'), "docTR not available -> fallback to PaddleOCR")
-        return _ocr_translate_page(page, model, src, tgt)
+        raise RuntimeError("docTR DocumentFile kullanılamıyor (import başarısız).")
     png_path, _ = _page_to_png(page, scale=max(OCR_SCALE, 3.0))
     try:
         pred = _get_doctr()
@@ -478,7 +451,7 @@ def translate_pdf(in_path: str, out_path: str, src: str, tgt: str, *, model: str
         elif pdf_mode == "ocr":
             _ocr_translate_page(page, model, src, tgt)
         elif pdf_mode == "ocr_doctr":
-            _ocr_translate_page(page, model, src, tgt)
+            _ocr_doctr_translate_page(page, model, src, tgt)
         elif pdf_mode == "ocr_rebuild":
             doc.close()
             translate_pdf_rebuild(in_path, out_path, src, tgt, model=model, task_id=task_id)
@@ -1124,6 +1097,43 @@ def translate_pdf_rebuild(in_path: str, out_path: str, src: str, tgt: str, *, mo
             tmp_path = os.path.join(TMP_DIR, f"reb_{uuid.uuid4().hex}.pdf")
             c = _rl_canvas.Canvas(tmp_path, pagesize=portrait((pw, ph)))
             def yflip(y): return ph - y  # RL alt-sol, fitz üst-sol
+            # --- helpers for wrapping & font measuring ---
+            from reportlab.pdfbase import pdfmetrics
+            def _wrap_text_to_width(text, font_name, font_size, max_width):
+                lines = []
+                for para in (text or "").splitlines():
+                    words = para.split()
+                    if not words:
+                        lines.append("")
+                        continue
+                    cur = words[0]
+                    for w in words[1:]:
+                        test = cur + " " + w
+                        if pdfmetrics.stringWidth(test, font_name, font_size) <= max_width:
+                            cur = test
+                        else:
+                            lines.append(cur)
+                            cur = w
+                    lines.append(cur)
+                return lines
+
+            def _shrink_to_fit(lines, font_name, font_size, max_width, max_height, leading_ratio=1.15, min_size=6):
+                size = font_size
+                while size > min_size:
+                    too_wide = any(pdfmetrics.stringWidth(ln, font_name, size) > max_width for ln in lines if ln)
+                    leading = size * leading_ratio
+                    needed_h = leading * max(1, len(lines))
+                    if (not too_wide) and (needed_h <= max_height):
+                        return size, leading
+                    size *= 0.92
+                return max(min_size, size), max(min_size, size) * leading_ratio
+
+
+            # draw original page image as background
+            try:
+                c.drawImage(png_path, 0, 0, width=pw, height=ph, preserveAspectRatio=False, mask=None)
+            except Exception:
+                pass
 
             for (x0, y0, x1, y1), txt in zip(boxes, translations):
                 h = (y1 - y0)
@@ -1132,8 +1142,19 @@ def translate_pdf_rebuild(in_path: str, out_path: str, src: str, tgt: str, *, mo
                     c.setFont(font_name, fontsize)
                 except Exception:
                     c.setFont("Helvetica", fontsize)
-                # İlk iterasyon: tek satır. (Sonraki adımda wrap eklenecek)
-                c.drawString(x0, yflip(y1) + 0.2*fontsize, txt)
+                # wrapping + shrink-to-fit inside bbox
+                box_w = max(1.0, (x1 - x0))
+                box_h = max(1.0, (y1 - y0))
+                lines = _wrap_text_to_width(txt, font_name, fontsize, box_w)
+                fontsize, leading = _shrink_to_fit(lines, font_name, fontsize, box_w, box_h)
+                try:
+                    c.setFont(font_name, fontsize)
+                except Exception:
+                    c.setFont("Helvetica", fontsize)
+                cur_y = (ph - y0) - (0.2 * fontsize)  # start near top of bbox
+                for ln in lines:
+                    c.drawString(x0, cur_y, ln)
+                    cur_y -= leading
 
             c.showPage(); c.save()
 
@@ -1172,112 +1193,72 @@ def _render_empty_pdf(pw: float, ph: float) -> str:
 # Fallback batch translator for OCR_REBUILD
 # ------------------------------------------------------------
 
+def _force_argos_cuda():
+    import os, importlib, sys
+    # Çeviri başlamadan evvel env'i garantiye al
+    if os.environ.get("ARGOS_DEVICE_TYPE") not in ("cuda", "auto"):
+        os.environ["ARGOS_DEVICE_TYPE"] = "cuda"
+    # CT2 daha gürültülü olsun ki log'da görelim
+    os.environ.setdefault("CT2_VERBOSE", "1")
+
+    # Tanılama log'u
+    try:
+        import ctranslate2 as ct
+        ct_file = getattr(ct, "__file__", "n/a")
+        has_cuda_attr = hasattr(ct, "has_cuda")
+        has_cuda_val = None
+        if has_cuda_attr:
+            try:
+                has_cuda_val = ct.has_cuda()
+            except Exception:
+                has_cuda_val = "error"
+        print(f"[ARGOSDBG] ARGOS_DEVICE_TYPE={os.environ.get('ARGOS_DEVICE_TYPE')} CT2_FILE={ct_file} HAS_CUDA_ATTR={has_cuda_attr} HAS_CUDA={has_cuda_val}", flush=True)
+    except Exception as e:
+        print(f"[ARGOSDBG] import ctranslate2 failed: {e}", flush=True)
+    return True
+
+
 def _translate_batch(texts, model, src, tgt, sample_text=None):
-    """
-    ARGOS: birebir çağrı (lokal, hızlı)
-    OLLAMA: metinleri numaralandırıp gruplar halinde TEK istekle çevirir, sonra geri eşler.
-    Bu sayede yüzlerce HTTP çağrısı yerine her grup için 1 çağrı yapılır.
-    """
+    out = []
     try:
         if (model or "").strip().upper() == "ARGOS":
-            out = []
             try:
                 import argostranslate.package, argostranslate.translate
             except Exception:
                 return [t for t in texts]
-            for t in texts:
+            for idx, t in enumerate(texts):
                 try:
                     out.append(argostranslate.translate.translate(t, src, tgt))
                 except Exception:
                     out.append(t)
             return out
-
-        # ---- OLLAMA (tek/az çağrı) ----
-        import requests, json, math
-
-        base_url = "http://127.0.0.1:11434/api/generate"
-        headers = {"Content-Type": "application/json"}
-
-        # Çok uzun PDF'lerde token sınırı için küçük gruplar kullan
-        CHUNK = 32  # gerekirse 24/16'ya düşürülebilir
-        out = [None] * len(texts)
-
-        def build_prompt(items):
-            # items: [(idx, text), ...]
-            numbered = "\n".join([f"{i+1}) {t}" for i, t in items])
-            return (
-                "You are a professional translator. Preserve meaning, tone, and style.\n"
-                "Return ONLY the translations, one per line, keeping the SAME numbering.\n"
-                f"Source language: {src}\n"
-                f"Target language: {tgt}\n"
-                "Text:\n<<<\n"
-                f"{numbered}\n"
-                ">>>"
+        else:
+            import requests, json
+            url = "http://127.0.0.1:11434/api/generate"
+            headers = {"Content-Type":"application/json"}
+            prompt_tpl = (
+                "You are a professional translator. Preserve meaning, tone, and style.\\n"
+                "Return only the translation without commentary.\\n"
+                "Source language: {src}\\n"
+                "Target language: {tgt}\\n"
+                "Text:\\n<<<\\n{txt}\\n>>>"
             )
-
-        for start in range(0, len(texts), CHUNK):
-            group = list(enumerate(texts[start:start+CHUNK], start=start))
-            # boş satırlar gereksiz yer kaplamasın
-            cleaned = [(i, (t or "").strip()) for i,t in group if (t or "").strip() != ""]
-            if not cleaned:
-                continue
-
-            prompt = build_prompt([(i, t) for i, t in cleaned])
-
-            payload = {
-                "model": model,
-                "prompt": prompt,
-                "stream": False,
-                "options": {"temperature": 0.2}
-            }
-
-            try:
-                r = requests.post(base_url, headers=headers, data=json.dumps(payload), timeout=60)
-                if not r.ok:
-                    # başarısızsa grup için fall-back: aynen geri koy
-                    for i, t in cleaned:
-                        out[i] = t
-                    continue
-
-                resp = (r.json().get("response") or "").strip()
-                # Beklenen çıktı:
-                # 1) ...
-                # 2) ...
-                # satır başında "N)" ile ayrılmış olmalı; değilse satır-satır dağıt
-                lines = [ln.strip() for ln in resp.splitlines() if ln.strip()]
-
-                # Basit ayrıştırıcı: "N) çeviri"
-                parsed = {}
-                for ln in lines:
-                    # 1) ...  /  12) ...
-                    if ")" in ln:
-                        head, rest = ln.split(")", 1)
-                        try:
-                            n = int(head.strip())
-                            parsed[n-1] = rest.strip()
-                        except Exception:
-                            pass
-
-                # Eğer numaralı ayrışmadıysa, sırayla eşle
-                if not parsed:
-                    for k,(i, _t) in enumerate(cleaned):
-                        out[i] = (lines[k] if k < len(lines) else _t)
-
-                else:
-                    # numaralı olanları yerleştir
-                    for k,(i, _t) in enumerate(cleaned):
-                        out[i] = parsed.get(k, _t)
-
-            except Exception:
-                # grup hatasında, fall-back
-                for i, t in cleaned:
-                    out[i] = t
-
-        # Boşta kalan None'lar varsa orijinali ver
-        for i,v in enumerate(out):
-            if v is None:
-                out[i] = texts[i]
-        return out
-
+            for t in texts:
+                payload = {
+                    "model": model,
+                    "prompt": prompt_tpl.format(src=src, tgt=tgt, txt=t),
+                    "stream": False,
+                    "options": {"temperature": 0.2}
+                }
+                try:
+                    r = requests.post(url, headers=headers, data=json.dumps(payload), timeout=20)
+                    if r.ok:
+                        js = r.json()
+                        out.append((js.get("response") or "").strip() or t)
+                    else:
+                        out.append(t)
+                except Exception:
+                    out.append(t)
+            return out
     except Exception:
         return [t for t in texts]
