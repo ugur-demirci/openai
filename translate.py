@@ -277,9 +277,8 @@ def _stable_translate_page(page: fitz.Page, model: str, src: str, tgt: str) -> N
     translations = _translate_batch([s["text"] for s in spans], model, src, tgt, sample_text=sample)
 
     for s in spans:
-
-        page.add_redact_annot(fitz.Rect(s["bbox"]), fill=None)
-
+        page.add_redact_annot(fitz.Rect(s["bbox"]), fill=(1,1,1))
+    page.apply_redactions()
     for s, t in zip(spans, translations):
 
         rect = fitz.Rect(s["bbox"])
