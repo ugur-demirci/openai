@@ -9,6 +9,7 @@ from fastapi.responses import PlainTextResponse, HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
 import uvicorn
+import traceback
 from lxml import etree as _ET
 import zipfile, io, tempfile, shutil
 
@@ -1713,4 +1714,5 @@ def download(file: str):
         raise
     except Exception as e:
         ringlog(f"DOWNLOAD error: {e}")
+        ringlog(traceback.format_exc())
         raise HTTPException(status_code=500, detail=f"download error: {e}")
