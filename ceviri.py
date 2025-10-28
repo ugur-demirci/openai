@@ -10,7 +10,7 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
 import uvicorn
 from lxml import etree as _ET
-import zipfile, shutil
+import zipfile, io, tempfile, shutil
 
 # --- 3rd party (graceful import) ---
 try:
@@ -189,7 +189,9 @@ def quick_xlsx_sample_text(path: str, limit_cells: int = 4000) -> str:
 
 def _guess_lang_heuristic(text: str) -> str:
     t = (text or "").lower()
+    # basit kelime/harf ipuçları
     import re
+    # ingilizce: tamamen ASCII + tipik kısa kelimeler
     if not any(ord(c)>127 for c in t) and re.search(r'\b(the|and|is|are|of|to|why|what|where|how)\b', t):
         return 'en'
     if re.search(r'\b(le|la|les|des|de|et|à|est|pas|pour)\b', t) or ('é' in t or 'è' in t or 'ç' in t):
@@ -215,31 +217,54 @@ def _guess_lang_heuristic(text: str) -> str:
     return 'auto'
 
 def detect_lang_auto(path: str, ext: str) -> str:
+
     lid_path = os.path.join(MODELS_DIR, "lid.176.ftz")
+
     if fasttext is None or not os.path.isfile(lid_path):
+
         ringlog("LID skip: fastText yok; source=auto")
+
         return "auto"
+
+
 
     sample = quick_docx_sample_text(path) if ext == ".docx" else quick_xlsx_sample_text(path)
+
     sample = (sample or "").strip()
+
     if not sample:
+
         return "auto"
 
+
+
     try:
+
         ft = fasttext.load_model(lid_path)
+
         counts = {}
+
         for line in itertools.islice((l for l in sample.splitlines() if l.strip()), 500):
+
             pred = ft.predict(line[:2000].replace("\t", " "), k=1)
+
             labels = pred[0] if isinstance(pred, tuple) and len(pred) >= 1 else list(pred)
+
             labels = list(labels) if not isinstance(labels, (list, tuple)) else labels
+
             lbl = (str(labels[0]) if labels else "auto").replace("__label__", "").lower()
+
             counts[lbl] = counts.get(lbl, 0) + 1
+
         return max(counts, key=counts.get) if counts else "auto"
+
     except Exception as e:
         ringlog(f"LID error: {e}")
         h = _guess_lang_heuristic(sample)
         ringlog(f"LID fallback(heur): {h}")
         return h
+
+
 
 # ---------- masking ----------
 MASK_PATTERNS = [
@@ -292,6 +317,7 @@ def _clean_nllb(text: str) -> str:
     text = re.sub(r">>\w+<<", " ", text)
     text = re.sub(r"\b\w{3}_(Latn|Cyrl|Arab|Deva|Hans|Hant)\b", " ", text)
     text = re.sub(r"\s{2,}", " ", text).strip()
+    # aşırı tekrarları törpüle (aynı kelime 6+)
     text = re.sub(r"(?:\s+(\S+))\1{6,}", lambda m: (" " + m.group(1))*5, " "+text).strip()
     return text
 
@@ -387,16 +413,20 @@ def argos_translate_batch(texts: List[str], src: str, tgt: str) -> List[str]:
         try:
             this_src = src
             if (src or "auto") == "auto":
+                # parça bazlı tespit
                 this_src = _guess_lang_heuristic(t)
             if not this_src or this_src == "auto" or this_src == tgt:
+                # kaynak bilinmiyorsa veya hedefle aynıysa çeviri anlamsız—pas geç
                 out = t or ""
             else:
                 out = argos_tr.translate(t or "", this_src, tgt)
+                # çok karışık belgelerde yanlış kaynakla aynı çıktıyı veriyorsa bir kez heuristik dene
                 if (not out or out.strip() == (t or "").strip()) and src != "auto":
                     h = _guess_lang_heuristic(t)
                     if h and h != "auto" and h != tgt and h != this_src:
                         try:
                             out2 = argos_tr.translate(t or "", h, tgt)
+                            # bir şey değiştiyse onu al
                             if out2 and out2.strip() != (t or "").strip():
                                 ringlog(f"ARGOS retry[{i}]: {this_src}->{tgt} -> {h}->{tgt}")
                                 out = out2
@@ -443,10 +473,13 @@ def translate_texts_pipeline_native(texts: List[str], engine: str, model_name: s
     for idx, m in enumerate(masked_list):
         parts = _split_sentences_keep_seps(m)
         for j, part in enumerate(parts):
-            is_sep = True if (j % 2 == 1) else False
+            is_sep = True if (j % 2 == 1) else False  # 0:text,1:sep,2:text,3:sep...
             owners.append((idx, j))
             chunk_is_sep.append(is_sep)
-            all_chunks.append(part)
+            if is_sep or not (part or "").strip():
+                all_chunks.append(part)
+            else:
+                all_chunks.append(part)
 
     # 3) translate only text chunks in batches
     def do_engine(texts_batch: List[str]) -> List[str]:
@@ -457,6 +490,7 @@ def translate_texts_pipeline_native(texts: List[str], engine: str, model_name: s
         else:
             raise HTTPException(status_code=400, detail=f"Unknown engine: {engine}")
 
+    # prepare indices
     to_tr_idx = [i for i, is_sep in enumerate(chunk_is_sep) if not is_sep and (all_chunks[i] or "").strip()]
     outs_map: Dict[int,str] = {}
     p = 0
@@ -472,7 +506,7 @@ def translate_texts_pipeline_native(texts: List[str], engine: str, model_name: s
             outs_map[ii] = trs[k]
         p = q
 
-    # 4) reassemble and unmask
+    # 4) reassemble and unmask per original text
     agg: Dict[int, List[str]] = {}
     for i,(owner_text_idx, part_idx) in enumerate(owners):
         s = outs_map[i] if i in outs_map else all_chunks[i]
@@ -537,27 +571,27 @@ def translate_docx(in_path: str, out_path: str, engine: str, model_name: str, sr
             pass
         if k % 50 == 0:
             ringlog(f"DOCX para {k}/{len(idxs)}")
-    # TextBox (DrawingML) içerikleri
+    # TextBox (DrawingML) içerikleri de çevir
     try:
         translate_docx_textboxes2(doc, engine, model_name, src, tgt, post_edit)
     except Exception as _e:
         ringlog(f"TextBox translate error: {_e}")
-    # DrawingML a:txBody
+    # DrawingML a:txBody (Text Box) içeriklerini de çevir
     try:
         translate_docx_draw_textbodies(doc, engine, model_name, src, tgt, post_edit)
     except Exception as _e:
         ringlog(f"DML TextBody translate error: {_e}")
-    # Genel kapsayıcılar
+    # GENEL drawing/text kapsayıcılarını da çevir
     try:
         translate_docx_any_drawing_text(doc, engine, model_name, src, tgt, post_edit)
     except Exception as _e:
         ringlog(f"DRAW/TEXT translate error: {_e}")
-    # SDT
+    # SDT (content control) paragraflarını da çevir
     try:
         translate_docx_sdt_paragraphs(doc, engine, model_name, src, tgt, post_edit)
     except Exception as _e:
         ringlog(f"SDT translate error: {_e}")
-    # Fallback
+    # Genel fallback: kalan tüm w:t paragraflarını (işlenmemiş) çevir
     try:
         translate_docx_all_wt_fallback(doc, engine, model_name, src, tgt, post_edit, processed_par_elems)
     except Exception as _e:
@@ -565,7 +599,6 @@ def translate_docx(in_path: str, out_path: str, engine: str, model_name: str, sr
 
     ringlog("DOCX kaydediliyor…")
     doc.save(out_path)
-
 # ---------- XLSX ----------
 def build_merged_maps(ws):
     masters, children = set(), set()
@@ -593,7 +626,7 @@ def translate_xlsx(in_path: str, out_path: str, engine: str, model_name: str, sr
                     continue
                 if isinstance(cell, MergedCell):
                     continue
-                if cell.data_type == 'f' or (isinstance(cell.value, str) and str(cell.value).startswith("=")):
+                if cell.data_type == 'f' or (isinstance(cell.value, str) and cell.value.startswith("=")):
                     continue
                 if getattr(cell, "is_date", False) or isinstance(cell.value, (int, float)):
                     continue
@@ -678,6 +711,18 @@ async def translate(
             if not chunk: break
             f.write(chunk)
     ringlog(f"Yükleme bitti: {up_path}")
+    
+    # Boyut limiti (MAX_FILE_MB) kontrolü
+    try:
+        sz = os.path.getsize(up_path)
+        if sz > (MAX_FILE_MB * 1024 * 1024):
+            ringlog(f"Dosya sınırı aşıldı: {sz} > {MAX_FILE_MB}MB")
+            os.remove(up_path)
+            raise HTTPException(status_code=413, detail="file too large")
+    except HTTPException:
+        raise
+    except Exception as _e:
+        ringlog(f"size check error: {_e}")
 
     src = (source_lang or "auto").lower().strip()
     if src == "auto":
@@ -697,10 +742,9 @@ async def translate(
         else:
             translate_xlsx(up_path, out_path, engine, model, src, target_lang, post_edit_model)
     except Exception as e:
-        # Gelişmiş traceback loglama
         try:
             import traceback
-            ringlog("Çeviri hatası (traceback başlıyor)")
+            ringlog("Çeviri hatası (traceback başlayor)")
             for line in traceback.format_exc().splitlines():
                 ringlog(line)
         except Exception:
@@ -729,7 +773,7 @@ def main():
     args = ap.parse_args()
     if args.serve:
         _ollama_warmup()
-        uvicorn.run("ceviri:app", host="0.0.0.0", port=args.port, workers=1)
+        uvicorn.run("ceviri:app", host="0.0.0.0", port=args.port, workers=1, access_log=False)
     else:
         print("Use --serve to start API")
 
@@ -794,26 +838,31 @@ def translate_texts_pipeline(texts: List[str], engine: str, model_name: str, src
     ringlog(f"PIPE: engine={engine} model={model_name or '-'} src={src} tgt={tgt} n={len(texts)} post_edit={post_edit or '-'}")
     """
     Wrapper:
-      - engine == "ollama" => LLM ile çeviri (maskeli)
+      - engine == "ollama" => LLM ile çeviri (maskeli), main.py yaklaşımı
       - diğerleri          => mevcut yerel akış (NLLB/Argos)
     """
     if engine == "ollama":
+        # Maskeleri uygula
         masked_list, banks_list = [], []
         for t in texts:
             m, bank = mask_protect(t or "")
             masked_list.append(m); banks_list.append(bank)
 
+        # LLM çevirisi
         llm_outs = translate_with_ollama_api(masked_list, model_name, src, tgt)
 
+        # (opsiyonel) Post-edit
         if post_edit:
             ringlog(f"POST-EDIT: model={post_edit} items={len(llm_outs)}")
             llm_outs = [ollama_post_edit(post_edit, x) for x in llm_outs]
 
+        # Maskeleri geri koy
         out_all = []
         for i, out in enumerate(llm_outs):
             out_all.append(mask_restore(out, banks_list[i]))
         return out_all
 
+    # Default: mevcut native akış
     return translate_texts_pipeline_native(texts, engine, model_name, src, tgt, post_edit)
 
 # === DOCX TextBox (DrawingML) çevirisi ===
@@ -824,10 +873,12 @@ except Exception:
 
 def _iter_doc_parts_for_txbx(document):
     """Belge part'larını (ana gövde + header/footer part'ları) güvenle üretir."""
+    # Ana belge
     try:
         yield document.part
     except Exception:
         pass
+    # Header/Footer part'ları
     try:
         for sec in getattr(document, "sections", []):
             try:
@@ -845,6 +896,33 @@ def _iter_doc_parts_for_txbx(document):
     except Exception:
         pass
 
+def _collect_dml_txbody_groups(root, ns):
+    """
+    DrawingML metin kutularını (a:txBody) topla ve metin nodelarıyla birlikte döndür.
+    return: [(t_nodes_list, joined_text), ...]
+    """
+    groups = []
+    try:
+        for tx in root.findall(".//a:txBody", ns):
+            t_nodes = tx.xpath(".//a:p//a:r//a:t", namespaces=ns)
+            if not t_nodes:
+                continue
+            txt = "".join([(t.text or "") for t in t_nodes]).strip()
+            if not txt:
+                continue
+            groups.append((t_nodes, txt))
+    except Exception:
+        return []
+    return groups
+    # Kimi DOCX'lerde iliştirilmiş ek header/footer part'ları olabilir:
+    try:
+        relparts = getattr(document.part, "related_parts", {})
+        for rp in getattr(relparts, "values", lambda: [])():
+            if hasattr(rp, "element"):
+                yield rp
+    except Exception:
+        pass
+
 def _collect_txbx_paragraph_elements(document):
     """Tüm part'larda w:txbxContent//w:p elementlerini döndürür (lxml elemanları)."""
     paras = []
@@ -858,7 +936,7 @@ def _collect_txbx_paragraph_elements(document):
     return paras
 
 def translate_docx_textboxes(document, engine: str, model_name: str, src: str, tgt: str, post_edit: Optional[str]):
-    """(Opsiyonel) Eski uyumluluk için basit TextBox çevirisi."""
+    """TextBox içi paragrafları çevirir (w:t düğümleri birleştirilip tek metin)."""
     try:
         paras = _collect_txbx_paragraph_elements(document)
     except Exception as e:
@@ -870,7 +948,7 @@ def translate_docx_textboxes(document, engine: str, model_name: str, src: str, t
         return
 
     texts = []
-    groups = []
+    groups = []  # her paragraf için w:t düğüm listesi
     for p in paras:
         try:
             t_nodes = p.xpath(".//w:t", namespaces=_DOCX_NSMAP)
@@ -891,8 +969,10 @@ def translate_docx_textboxes(document, engine: str, model_name: str, src: str, t
     ringlog(f"TextBox paragraphs to_translate={len(texts)}")
     outs = translate_texts_pipeline(texts, engine, model_name, src, tgt, post_edit)
 
+    # Geri yaz
     for t_nodes, new_txt in zip(groups, outs):
         try:
+            # ilk w:t'ye çeviriyi yaz, diğerlerini boşalt
             t_nodes[0].text = new_txt
             for tn in t_nodes[1:]:
                 tn.text = ""
@@ -903,6 +983,7 @@ def translate_docx_textboxes(document, engine: str, model_name: str, src: str, t
 
 # === Genişletilmiş DOCX TextBox (DrawingML + VML) çevirisi ===
 def _get_nsmap():
+    # python-docx nsmap eksikse kendimiz tamamlayalım
     ns = {
         "w":   "http://schemas.openxmlformats.org/wordprocessingml/2006/main",
         "a":   "http://schemas.openxmlformats.org/drawingml/2006/main",
@@ -913,8 +994,8 @@ def _get_nsmap():
         "mc":  "http://schemas.openxmlformats.org/markup-compatibility/2006",
     }
     try:
-        from docx.oxml.ns import nsmap as _DOCX_NSMAP2
-        ns.update({k:v for k,v in _DOCX_NSMAP2.items() if k and v})
+        from docx.oxml.ns import nsmap as _DOCX_NSMAP
+        ns.update({k:v for k,v in _DOCX_NSMAP.items() if k and v})
     except Exception:
         pass
     return ns
@@ -928,6 +1009,7 @@ def _iter_doc_parts_for_txbx2(document):
                     yield part.part
     except Exception:
         pass
+    # related parts (ör. ek header/footer veya embedded)
     try:
         relparts = getattr(document.part, "related_parts", {})
         for rp in getattr(relparts, "values", lambda: [])():
@@ -937,11 +1019,12 @@ def _iter_doc_parts_for_txbx2(document):
         pass
 
 def _collect_txbx_paragraph_elements2(document):
+    """Tüm part'larda (DrawingML + VML) text box paragraflarını topla."""
     ns = _get_nsmap()
     xpaths = [
-        ".//w:txbxContent//w:p",
-        ".//wps:txbx//w:p",
-        ".//v:textbox//w:p",
+        ".//w:txbxContent//w:p",   # genel
+        ".//wps:txbx//w:p",        # Word 2010 shapes
+        ".//v:textbox//w:p",       # legacy VML textbox
     ]
     paras = []
     for part in _iter_doc_parts_for_txbx2(document):
@@ -955,6 +1038,7 @@ def _collect_txbx_paragraph_elements2(document):
     return paras
 
 def translate_docx_textboxes2(document, engine: str, model_name: str, src: str, tgt: str, post_edit: Optional[str]):
+    """TextBox içi paragrafları çevir (birleştir, çevir, ilk w:t'ye yaz)."""
     try:
         paras = _collect_txbx_paragraph_elements2(document)
     except Exception as e:
@@ -966,7 +1050,7 @@ def translate_docx_textboxes2(document, engine: str, model_name: str, src: str, 
         return
 
     texts = []
-    groups = []
+    groups = []   # her paragraf için w:t düğümleri
     ns = _get_nsmap()
     for p in paras:
         try:
@@ -988,6 +1072,7 @@ def translate_docx_textboxes2(document, engine: str, model_name: str, src: str, 
     ringlog(f"TextBox(2) paragraphs to_translate={len(texts)}")
     outs = translate_texts_pipeline(texts, engine, model_name, src, tgt, post_edit)
 
+    # Geri yaz
     for t_nodes, new_txt in zip(groups, outs):
         try:
             t_nodes[0].text = new_txt
@@ -1010,14 +1095,16 @@ def _nsmap_full():
         "mc":  "http://schemas.openxmlformats.org/markup-compatibility/2006",
     }
     try:
-        from docx.oxml.ns import nsmap as _DOCX_NSMAP3
-        ns.update({k:v for k,v in _DOCX_NSMAP3.items() if k and v})
+        from docx.oxml.ns import nsmap as _DOCX_NSMAP  # type: ignore
+        ns.update({k:v for k,v in _DOCX_NSMAP.items() if k and v})
     except Exception:
         pass
     return ns
 
 def _iter_all_parts(document):
+    # Main document
     yield document.part
+    # Section header/footer
     try:
         for sect in document.sections:
             for part in (sect.header, sect.footer):
@@ -1025,6 +1112,7 @@ def _iter_all_parts(document):
                     yield part.part
     except Exception:
         pass
+    # Related parts (embedded/extra)
     try:
         relparts = getattr(document.part, "related_parts", {})
         for rp in getattr(relparts, "values", lambda: [])():
@@ -1034,10 +1122,12 @@ def _iter_all_parts(document):
         pass
 
 def _collect_dml_textbodies(document):
+    """Tüm part'larda a:txBody düğümlerini toplar."""
     ns = _nsmap_full()
     bodies = []
     for part in _iter_all_parts(document):
         try:
+            # a:txBody genelde wp:inline/wp:anchor altında gelir
             found = part.element.xpath(".//a:txBody", namespaces=ns)
             if found:
                 bodies.extend(found)
@@ -1046,6 +1136,10 @@ def _collect_dml_textbodies(document):
     return bodies
 
 def translate_docx_draw_textbodies(document, engine: str, model_name: str, src: str, tgt: str, post_edit: Optional[str]):
+    """
+    Her a:txBody içinde yer alan a:p/a:r/a:t düğümlerini toplayıp tek metin haline getirir,
+    çevirir ve ilk a:t'ye yazar, diğerlerini boşaltır.
+    """
     ns = _nsmap_full()
     bodies = _collect_dml_textbodies(document)
     if not bodies:
@@ -1053,7 +1147,7 @@ def translate_docx_draw_textbodies(document, engine: str, model_name: str, src: 
         return
 
     texts = []
-    groups = []
+    groups = []  # her body için (t_nodes listesi)
     for body in bodies:
         try:
             t_nodes = body.xpath(".//a:p//a:r//a:t", namespaces=ns)
@@ -1074,6 +1168,7 @@ def translate_docx_draw_textbodies(document, engine: str, model_name: str, src: 
     ringlog(f"DML TextBody to_translate={len(texts)}")
     outs = translate_texts_pipeline(texts, engine, model_name, src, tgt, post_edit)
 
+    # Geri yaz
     for t_nodes, new_txt in zip(groups, outs):
         try:
             t_nodes[0].text = new_txt
@@ -1098,14 +1193,16 @@ def _docx_nsmap_all():
         "dgm": "http://schemas.openxmlformats.org/drawingml/2006/diagram",
     }
     try:
-        from docx.oxml.ns import nsmap as _DOCX_NSMAP4
-        ns.update({k:v for k,v in _DOCX_NSMAP4.items() if k and v})
+        from docx.oxml.ns import nsmap as _DOCX_NSMAP  # type: ignore
+        ns.update({k:v for k,v in _DOCX_NSMAP.items() if k and v})
     except Exception:
         pass
     return ns
 
 def _iter_all_parts_for_draw(document):
+    # Main
     yield document.part
+    # Section header/footer
     try:
         for sect in document.sections:
             for part in (sect.header, sect.footer):
@@ -1113,6 +1210,7 @@ def _iter_all_parts_for_draw(document):
                     yield part.part
     except Exception:
         pass
+    # Related parts
     try:
         relparts = getattr(document.part, "related_parts", {})
         for rp in getattr(relparts, "values", lambda: [])():
@@ -1122,6 +1220,17 @@ def _iter_all_parts_for_draw(document):
         pass
 
 def _collect_generic_text_containers(document):
+    """
+    Kapsayıcı düğümler:
+      - w:drawing
+      - w:pict
+      - mc:AlternateContent
+      - w:txbxContent
+      - wps:txbx
+      - v:textbox
+      - a:txBody (DrawingML)
+    Her kapsayıcı içinde w:t düğümlerini toplayacağız.
+    """
     ns = _docx_nsmap_all()
     container_xpaths = [
         ".//w:drawing",
@@ -1142,11 +1251,12 @@ def _collect_generic_text_containers(document):
                     containers.extend(found)
             except Exception:
                 continue
+    # Aynı düğümü tekrarlamayalım
     uniq = []
     seen = set()
     for c in containers:
         key = id(c)
-        if key in seen:
+        if key in seen: 
             continue
         seen.add(key)
         uniq.append(c)
@@ -1159,10 +1269,11 @@ def translate_docx_any_drawing_text(document, engine: str, model_name: str, src:
         ringlog("DRAW/TEXT: kapsayıcı bulunamadı")
         return
 
-    groups = []
+    groups = []  # her kapsayıcı için w:t düğüm listesi
     texts  = []
     for c in containers:
         try:
+            # Bu kapsayıcı içindeki tüm w:t düğümlerini sırayla al
             t_nodes = c.xpath(".//w:t", namespaces=ns)
             if not t_nodes:
                 continue
@@ -1181,6 +1292,7 @@ def translate_docx_any_drawing_text(document, engine: str, model_name: str, src:
     ringlog(f"DRAW/TEXT groups to_translate={len(texts)}")
     outs = translate_texts_pipeline(texts, engine, model_name, src, tgt, post_edit)
 
+    # Geri yaz: her grup tek satır
     for t_nodes, new_txt in zip(groups, outs):
         try:
             t_nodes[0].text = new_txt
@@ -1191,7 +1303,7 @@ def translate_docx_any_drawing_text(document, engine: str, model_name: str, src:
 
     ringlog("DRAW/TEXT: çeviri tamamlandı")
 
-# === DOCX Content Control (SDT) ===
+# === DOCX Content Control (SDT) içindeki paragrafları çevir ===
 def _nsmap_all():
     ns = {
         "w":   "http://schemas.openxmlformats.org/wordprocessingml/2006/main",
@@ -1205,8 +1317,8 @@ def _nsmap_all():
         "dgm": "http://schemas.openxmlformats.org/drawingml/2006/diagram",
     }
     try:
-        from docx.oxml.ns import nsmap as _DOCX_NSMAP5
-        ns.update({k:v for k,v in _DOCX_NSMAP5.items() if k and v})
+        from docx.oxml.ns import nsmap as _DOCX_NSMAP  # type: ignore
+        ns.update({k:v for k,v in _DOCX_NSMAP.items() if k and v})
     except Exception:
         pass
     return ns
@@ -1233,6 +1345,7 @@ def _collect_sdt_paragraphs(document):
     paras = []
     for part in _iter_all_parts_for_sdt(document):
         try:
+            # SDT content: w:sdt//w:sdtContent//w:p
             found = part.element.xpath(".//w:sdt//w:sdtContent//w:p", namespaces=ns)
             if found:
                 paras.extend(found)
@@ -1247,7 +1360,7 @@ def translate_docx_sdt_paragraphs(document, engine: str, model_name: str, src: s
         ringlog("SDT: bulunamadı")
         return
 
-    texts, groups = [], []
+    texts, groups = [], []   # her paragraf için w:t düğüm grubu
     for p in paras:
         try:
             t_nodes = p.xpath(".//w:r//w:t", namespaces=ns) or p.xpath(".//w:t", namespaces=ns)
@@ -1292,14 +1405,16 @@ def _ns_all_docx():
         "dgm": "http://schemas.openxmlformats.org/drawingml/2006/diagram",
     }
     try:
-        from docx.oxml.ns import nsmap as _DOCX_NSMAP6
-        ns.update({k:v for k,v in _DOCX_NSMAP6.items() if k and v})
+        from docx.oxml.ns import nsmap as _DOCX_NSMAP  # type: ignore
+        ns.update({k:v for k,v in _DOCX_NSMAP.items() if k and v})
     except Exception:
         pass
     return ns
 
 def _iter_all_parts_generic(document):
+    # Main
     yield document.part
+    # Section header/footer
     try:
         for sect in document.sections:
             for part in (sect.header, sect.footer):
@@ -1307,6 +1422,7 @@ def _iter_all_parts_generic(document):
                     yield part.part
     except Exception:
         pass
+    # Related parts
     try:
         relparts = getattr(document.part, "related_parts", {})
         for rp in getattr(relparts, "values", lambda: [])():
@@ -1316,19 +1432,21 @@ def _iter_all_parts_generic(document):
         pass
 
 def _nearest_w_p(elem, ns):
+    """Verilen XML elem için en yakın üst w:p'yi bul."""
     cur = elem
     while cur is not None:
-        try:
-            if cur.tag.endswith("}p") or cur.tag == "{%s}p" % ns["w"]:
-                return cur
-            cur = cur.getparent() if hasattr(cur, "getparent") else None
-        except Exception:
-            break
+        if cur.tag.endswith("}p") or cur.tag == "{%s}p" % ns["w"]:
+            return cur
+        cur = cur.getparent() if hasattr(cur, "getparent") else None
     return None
 
 def translate_docx_all_wt_fallback(document, engine: str, model_name: str, src: str, tgt: str, post_edit: Optional[str], processed_par_elems: set):
+    """
+    İşlenmemiş tüm paragrafların (w:p) içindeki w:t'leri grupla, çevir, geri yaz.
+    processed_par_elems: daha önce normal akışta çevirdiğimiz w:p elementleri (dokunma).
+    """
     ns = _ns_all_docx()
-    groups = []
+    groups = []  # [(p_elem, [t_nodes])]
     seen_p = set()
 
     for part in _iter_all_parts_generic(document):
@@ -1338,12 +1456,14 @@ def translate_docx_all_wt_fallback(document, engine: str, model_name: str, src: 
             t_nodes = []
         for tn in t_nodes:
             p = _nearest_w_p(tn, ns)
-            if p is None:
+            if p is None: 
                 continue
             if p in processed_par_elems:
+                # Bu paragraf zaten normal DOCX akışında çevrildi
                 continue
             if id(p) in seen_p:
                 continue
+            # Bu paragrafın tüm t'lerini topla
             try:
                 p_t_nodes = p.xpath(".//w:r//w:t", namespaces=ns) or p.xpath(".//w:t", namespaces=ns)
             except Exception:
@@ -1360,11 +1480,16 @@ def translate_docx_all_wt_fallback(document, engine: str, model_name: str, src: 
     texts = []
     for _, tnodes in groups:
         raw = "".join([(t.text or "") for t in tnodes]).strip()
-        texts.append(raw if raw else "")
+        if not raw:
+            texts.append("")  # boş kalabilir
+        else:
+            texts.append(raw)
 
+    # Boşlar varsa yine de çeviri çağrısı düzgün çalışsın
     ringlog(f"FALLBACK w:t: groups={len(groups)}")
     outs = translate_texts_pipeline(texts, engine, model_name, src, tgt, post_edit)
 
+    # Geri yaz
     changed = 0
     for (_, tnodes), new_txt in zip(groups, outs):
         if not tnodes:
@@ -1378,7 +1503,7 @@ def translate_docx_all_wt_fallback(document, engine: str, model_name: str, src: 
             continue
     ringlog(f"FALLBACK w:t: çeviri tamamlandı (paragraf={changed})")
 
-# === ZIP FALLBACK: DOCX içindeki tüm XML'lerde w:t ve a:txBody metinlerini tarayıp çevir ===
+# === ZIP FALLBACK: DOCX içindeki tüm XML'lerde w:t düğümlerini tarayıp çevir ===
 def _ns_zip_all():
     return {
         "w":   "http://schemas.openxmlformats.org/wordprocessingml/2006/main",
@@ -1392,8 +1517,25 @@ def _ns_zip_all():
         "dgm": "http://schemas.openxmlformats.org/drawingml/2006/diagram",
     }
 
+_FRENCH_HINT_RX = re.compile(r"\b(le|la|les|des|de|du|d’|l’|au|aux|un|une|et|ou|dans|avec|pour|sur|par|en)\b", re.IGNORECASE)
+_NONASCII_RX    = re.compile(r"[^\x00-\x7F]")
+
+def _looks_french_or_nonascii(s: str, src_lang: str) -> bool:
+    if not s or not s.strip():
+        return False
+    if _NONASCII_RX.search(s):
+        return True
+    if (src_lang or "auto").lower() in ("fr","auto"):
+        return bool(_FRENCH_HINT_RX.search(s))
+    return False
+
 def _zip_read_all_word_xml(zf):
-    return [name for name in zf.namelist() if name.startswith("word/") and name.endswith(".xml")]
+    # word/ altındaki tüm .xml dosyalarını getir
+    xml_entries = []
+    for name in zf.namelist():
+        if name.startswith("word/") and name.endswith(".xml"):
+            xml_entries.append(name)
+    return xml_entries
 
 def translate_docx_zip_fallback(out_path: str, engine: str, model_name: str, src: str, tgt: str, post_edit: Optional[str]):
     ns = _ns_zip_all()
@@ -1402,35 +1544,28 @@ def translate_docx_zip_fallback(out_path: str, engine: str, model_name: str, src
             names = _zip_read_all_word_xml(zf)
             mem = {n: zf.read(n) for n in zf.namelist()}
 
-        parsed = {}
+        # 1) DrawingML a:txBody grupları
         dml_groups = []
+        parsed = {}
         for name in names:
             try:
                 root = _ET.fromstring(mem[name])
             except Exception:
                 continue
             parsed[name] = root
-            # a:txBody text groups
-            try:
-                tbs = root.xpath(".//a:txBody", namespaces=ns)
-                for tx in tbs:
-                    t_nodes = tx.xpath(".//a:p//a:r//a:t", namespaces=ns)
-                    if not t_nodes: 
-                        continue
-                    txt = "".join([(t.text or "") for t in t_nodes]).strip()
-                    if not txt:
-                        continue
-                    dml_groups.append((name, t_nodes, txt))
-            except Exception:
-                continue
+            groups = _collect_dml_txbody_groups(root, ns)
+            for t_nodes, text in groups:
+                if _looks_french_or_nonascii(text, src):
+                    dml_groups.append((name, t_nodes, text))
 
         if dml_groups:
             ringlog(f"ZIP-DML: txBody groups to_translate={len(dml_groups)}")
             texts = [g[2] for g in dml_groups]
             outs  = translate_texts_pipeline(texts, engine, model_name, src, tgt, post_edit)
             for (name, t_nodes, _), new_txt in zip(dml_groups, outs):
+                joined = (new_txt or "")
                 if t_nodes:
-                    t_nodes[0].text = new_txt or ""
+                    t_nodes[0].text = joined
                     for tn in t_nodes[1:]:
                         tn.text = ""
             for name in {n for (n, *_ ) in dml_groups}:
@@ -1439,31 +1574,28 @@ def translate_docx_zip_fallback(out_path: str, engine: str, model_name: str, src
         else:
             ringlog("ZIP-DML: txBody group bulunamadı")
 
-        # w:t fallback
+        # 2) w:t fallback
         wt_nodes, wt_names, wt_texts = [], [], []
         for name in names:
-            root = parsed.get(name)
-            if root is None:
+            if name in parsed:
+                root = parsed[name]
+            else:
                 try:
                     root = _ET.fromstring(mem[name])
                 except Exception:
                     continue
                 parsed[name] = root
-            try:
-                t_nodes = root.xpath(".//w:t", namespaces=ns)
-            except Exception:
-                t_nodes = []
+            t_nodes = root.xpath(".//w:t", namespaces=ns)
             for tn in t_nodes:
                 txt = (tn.text or "").strip()
-                if not txt:
-                    continue
-                wt_nodes.append(tn); wt_names.append(name); wt_texts.append(txt)
+                if _looks_french_or_nonascii(txt, src):
+                    wt_nodes.append(tn); wt_names.append(name); wt_texts.append(txt)
 
         if wt_texts:
             ringlog(f"ZIP-w:t: to_translate={len(wt_texts)}")
             outs = translate_texts_pipeline(wt_texts, engine, model_name, src, tgt, post_edit)
             for tn, new_txt in zip(wt_nodes, outs):
-                tn.text = new_txt or ""
+                tn.text = new_txt
             for name in set(wt_names):
                 xml_bytes = _ET.tostring(parsed[name], encoding="utf-8", xml_declaration=True, standalone=False)
                 mem[name] = xml_bytes
@@ -1478,27 +1610,95 @@ def translate_docx_zip_fallback(out_path: str, engine: str, model_name: str, src
         ringlog("ZIP-FALLBACK: yazıldı (DML + w:t)")
     except Exception as e:
         ringlog(f"ZIP-FALLBACK error: {e}")
+    ns = _ns_zip_all()
+    try:
+        with zipfile.ZipFile(out_path, "r") as zf:
+            names = _zip_read_all_word_xml(zf)
+            # Bellekte kopyasını hazırlayacağız (Zip dosyası in-place editlemez)
+            mem = {}
+            for n in zf.namelist():
+                mem[n] = zf.read(n)
 
-# ---- Güvenli indirme ----
+        total_candidates = 0
+        total_changed = 0
+        # Tüm w:t metinlerini toplayıp batch çeviri yapacağız; ancak aşırı büyük dosyalarda
+        # parça parça işleyelim:
+        batch_nodes = []  # (name, tree, node)
+        batch_texts = []
+        parsed_cache = {}  # name -> (_ET.ElementTree, root)
+        for name in names:
+            try:
+                tree = _ET.fromstring(mem[name])
+            except Exception:
+                continue
+            parsed_cache[name] = (tree, tree)
+            # XPath: tüm w:t düğümleri
+            t_nodes = tree.xpath(".//w:t", namespaces=ns)
+            for tn in t_nodes:
+                txt = (tn.text or "").strip()
+                if _looks_french_or_nonascii(txt, src):
+                    batch_nodes.append((name, tn))
+                    batch_texts.append(txt)
+            total_candidates += len(t_nodes)
+
+        if not batch_texts:
+            ringlog("ZIP-FALLBACK: çevrilecek w:t bulunamadı")
+            return
+
+        ringlog(f"ZIP-FALLBACK: candidates={len(batch_texts)}/{total_candidates} (word/*.xml)")
+        # Batch çeviri (mevcut pipeline)
+        outs = translate_texts_pipeline(batch_texts, engine, model_name, src, tgt, post_edit)
+
+        # Çeviriyi yerine yaz
+        for (name, tn), new_txt in zip(batch_nodes, outs):
+            try:
+                tn.text = new_txt
+                total_changed += 1
+            except Exception:
+                continue
+
+        # Yeni zip'i yaz
+        tmp_out = out_path + ".tmpzip"
+        with zipfile.ZipFile(tmp_out, "w", zipfile.ZIP_DEFLATED) as zfw:
+            for n, data in mem.items():
+                if n in parsed_cache:
+                    root = parsed_cache[n][0]
+                    xml_bytes = _ET.tostring(root, encoding="utf-8", xml_declaration=True, standalone=False)
+                    zfw.writestr(n, xml_bytes)
+                else:
+                    zfw.writestr(n, data)
+        # Yerine koy
+        shutil.move(tmp_out, out_path)
+        ringlog(f"ZIP-FALLBACK: yazıldı (changed={total_changed})")
+    except Exception as e:
+        ringlog(f"ZIP-FALLBACK error: {e}")
+
+
 @app.get("/download")
 def download(file: str):
     """
     Güvenli indirme:
     - Sadece OUTPUTS_DIR altından dosya verir
-    - file paramı yalnızca dosya adı olmalı
+    - file paramı yalnızca dosya adı (out.output_file) olmalı
     """
     try:
         base = Path(OUTPUTS_DIR).resolve()
+        # Sadece dosya adını al (üst dizin kaçışı engelle)
         fname = os.path.basename(file)
         if not fname:
             raise HTTPException(status_code=400, detail="empty filename")
         p = (base / fname).resolve()
+
+        # Base dışına kaçmayı engelle
         if not str(p).startswith(str(base) + os.sep):
             ringlog(f"DOWNLOAD blocked: resolved outside base -> {p}")
             raise HTTPException(status_code=400, detail="invalid path")
+
         if not p.exists() or not p.is_file():
             ringlog(f"DOWNLOAD not found: {p}")
             raise HTTPException(status_code=404, detail="not found")
+
+        # İçerik türü
         name = p.name.lower()
         if name.endswith(".docx"):
             media = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
@@ -1506,6 +1706,7 @@ def download(file: str):
             media = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
         else:
             media = "application/octet-stream"
+
         ringlog(f"DOWNLOAD ok: {p}")
         return FileResponse(str(p), media_type=media, filename=p.name)
     except HTTPException:
