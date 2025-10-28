@@ -1,0 +1,283 @@
+<!doctype html>
+<html lang="tr">
+<head>
+  <meta charset="utf-8" />
+  <title>Doküman Çeviri</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <style>
+    :root {
+      --bg: #0b1020; --fg: #e6e9f2; --muted:#a6adbb; --card:#12182b; --accent:#5ea1ff; --ok:#46c37b; --warn:#ffb454;
+      --danger:#ff6363; --border:#223055;
+    }
+    * { box-sizing: border-box; }
+    body { margin:0; font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, "Helvetica Neue", Arial;
+           background:var(--bg); color:var(--fg); }
+    header { padding:16px 20px; border-bottom:1px solid var(--border); background:#0d1430; position:sticky; top:0; z-index:1;}
+    header h1 { margin:0; font-size:18px; letter-spacing:.5px; }
+    .container { max-width:1100px; margin:24px auto; padding:0 16px; }
+    .card { background:var(--card); border:1px solid var(--border); border-radius:14px; padding:16px; }
+    .row { display:flex; gap:12px; flex-wrap:wrap; }
+    .col { flex:1 1 240px; min-width:240px; }
+    label { font-size:12px; color:var(--muted); display:block; margin:6px 0 6px; }
+    select, input[type="file"], button, .btn {
+      background:#0f1631; color:var(--fg); border:1px solid var(--border); border-radius:10px; padding:10px 12px;
+      width:100%;
+    }
+    select:focus, input:focus, button:focus { outline:2px solid var(--accent); }
+    .actions { display:flex; align-items:center; gap:12px; flex-wrap:wrap; }
+    .btn { display:inline-flex; align-items:center; justify-content:center; gap:8px; cursor:pointer; width:auto; }
+    .btn.fill { display:block; width:100%; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+    #downloadSpan { flex:1; display:flex; }
+    .btn.primary { background: var(--accent); color:#061024; border-color: transparent; }
+    .btn.ghost { background: transparent; }
+    .hint { font-size:12px; color:var(--muted); }
+    .dragger {
+      border: 2px dashed var(--border); border-radius:14px; padding:18px; text-align:center; cursor:pointer;
+      background: #0c132b;
+    }
+    .dragger.dragover{ border-color: var(--accent); background:#0c173a;}
+    .log { background:#070c1a; border:1px solid var(--border); border-radius:12px; padding:10px; min-height:160px; white-space:pre-wrap; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size:12px; overflow:auto;}
+    /* fixed height ~15 lines */
+    .log { line-height: 1.3; height: calc(15 * 1.3em); max-height: calc(15 * 1.3em); overflow:auto; }
+    .badge { font-size:11px; padding:2px 6px; border-radius:10px; background:#0b1b39; border:1px solid var(--border); color:var(--muted); }
+    .ok { color: var(--ok); }
+    .warn { color: var(--warn); }
+    .danger { color: var(--danger); }
+    .divider { height:1px; background:var(--border); margin:14px 0; }
+    footer { color:var(--muted); font-size:12px; text-align:center; padding:16px 0 40px; }
+    a { color: var(--accent); text-decoration: none; }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>Doküman Çeviri <span class="badge">Beta</span></h1>
+  </header>
+
+  <div class="container">
+    <div class="card" id="uploadCard">
+      <div class="row">
+        <div class="col">
+          <label>Belge Yükle (.docx / .xlsx / .xlsm / .xltx / .xltm)</label>
+          <div id="drop" class="dragger">
+            <strong>Sürükle & bırak</strong> ya da tıkla ve seç
+            <div class="hint" id="fileHint">Henüz dosya seçilmedi</div>
+            <input id="fileInput" type="file" accept=".docx,.xlsx,.xlsm,.xltx,.xltm" style="display:none" />
+          </div>
+        </div>
+      </div>
+
+      <div class="divider"></div>
+
+      <div class="row">
+        <div class="col">
+          <label>Source Language</label>
+          <select id="sourceLang"></select>
+        </div>
+        <div class="col">
+          <label>Target Language</label>
+          <select id="targetLang"></select>
+        </div>
+        <div class="col">
+          <label>Model Seçim</label>
+          <select id="engineModel"></select>
+        </div>
+        <div class="col">
+          <label>Post-Edit (Ollama - opsiyonel)</label>
+          <select id="postEdit">
+            <option value="">(Yok)</option>
+          </select>
+        </div>
+      </div>
+
+      <div class="row" style="margin-top:8px;">
+        <div class="col actions">
+          <button class="btn primary" id="startBtn">Çeviriye Başla</button>
+          <span id="downloadSpan" class="hint"></span>
+        </div>
+      </div>
+
+      <div class="divider"></div>
+
+      <label id="logsLabel" style="cursor:pointer;">Sistem Logları</label>
+      <div class="log" id="logs">(log bekleniyor…)</div>
+    </div>
+
+    <footer><span id="refreshOllama" class="hint" style="cursor:pointer; text-decoration: underline;">Ollama Modellerini Yenile</span></footer>
+  </div>
+
+<script>
+const $ = sel => document.querySelector(sel);
+const api = (path) => path; // aynı host/port
+const S = { langs: [], models: { nllb:[], argos:[], ollama:[], default_engine:'nllb', default_model:'' }, file: null, polling: null, logLimit: 200, userReadingHistory: false, acceptEmpty: false };
+
+async function loadLanguages(){
+  const res = await fetch(api('/languages'));
+  const data = await res.json();
+  S.langs = data;
+  const sSel = $('#sourceLang'), tSel = $('#targetLang');
+  sSel.innerHTML = ''; tSel.innerHTML = '';
+  for(const {code, name} of data){
+    const o1 = document.createElement('option');
+    o1.value = code; o1.textContent = name;
+    sSel.appendChild(o1);
+    if(code !== 'auto'){
+      const o2 = document.createElement('option');
+      o2.value = code; o2.textContent = name;
+      tSel.appendChild(o2);
+    }
+  }
+  sSel.value = 'auto';
+  tSel.value = 'en';
+}
+
+function optGroup(label, arr, prefix){
+  const frag = document.createDocumentFragment();
+  if(arr.length){
+    const og = document.createElement('optgroup');
+    og.label = label;
+    for(const m of arr){
+      const o = document.createElement('option');
+      o.value = `${prefix}:${m}`;
+      o.textContent = m;
+      og.appendChild(o);
+    }
+    frag.appendChild(og);
+  }
+  return frag;
+}
+
+async function loadModels(){
+  const res = await fetch(api('/models'));
+  const data = await res.json();
+  S.models = data;
+  const sel = $('#engineModel');
+  sel.innerHTML = '';
+  sel.appendChild(optGroup('NLLB', data.nllb || [], 'nllb'));
+  (function(){const og=document.createElement('optgroup');og.label='Argos';const o=document.createElement('option');o.value='argos';o.textContent='Argos';og.appendChild(o);sel.appendChild(og);})();if (data.ollama && data.ollama.length){
+    const og = document.createElement('optgroup');
+    og.label = 'Ollama';
+    for(const m of data.ollama){
+      const o = document.createElement('option');
+      o.value = `ollama:${m}`;
+      o.textContent = m;
+      og.appendChild(o);
+    }
+    sel.appendChild(og);
+  }
+  const defEngine = (data.default_engine || 'nllb');
+  const defModel  = (data.default_model || '');
+  const __ds = $('#defaultsSpan'); if (__ds) __ds.textContent = `${defEngine} / ${defModel}`;
+  const defaultValue = `nllb:${defModel || 'nllb_ct2/600M-int8'}`;
+  if ([...sel.options].some(o => o.value === defaultValue)){ sel.value = defaultValue; }
+  else if (sel.options.length){ sel.selectedIndex = 0; }
+  const pe = $('#postEdit');
+  const keepFirst = pe.querySelector('option');
+  pe.innerHTML = ''; pe.appendChild(keepFirst);
+  for(const m of (data.ollama || [])){
+    const o = document.createElement('option');
+    o.value = m; o.textContent = m;
+    pe.appendChild(o);
+  }
+}
+
+function setupDragDrop(){
+  const drop = $('#drop'); const inp  = $('#fileInput');
+  function setHint(name){ $('#fileHint').textContent = name ? `Seçildi: ${name}` : 'Henüz dosya seçilmedi'; }
+  drop.addEventListener('click', ()=> inp.click());
+  drop.addEventListener('dragover', (e)=>{ e.preventDefault(); drop.classList.add('dragover'); });
+  drop.addEventListener('dragleave', ()=> drop.classList.remove('dragover'));
+  drop.addEventListener('drop', (e)=>{ e.preventDefault(); drop.classList.remove('dragover'); const f = e.dataTransfer.files[0]; if (!f) return; S.file = f; setHint(f.name); });
+  inp.addEventListener('change', ()=>{ const f = inp.files[0]; if(!f) return; S.file = f; setHint(f.name); });
+}
+
+function printLogLine(line){ const log = $('#logs'); log.textContent += (log.textContent ? '\n' : '') + line; log.scrollTop = log.scrollHeight; }
+
+async function pollLogs(){
+  try{
+    const res = await fetch(api(`/logs?limit=${S.logLimit}`));
+    const data = await res.json();
+    const lines = data.lines || [];
+    const log = $('#logs');
+    const atBottom = (log.scrollHeight - log.scrollTop - log.clientHeight) < 8;
+    const prevHeight = log.scrollHeight;
+    const prevTop = log.scrollTop;
+    if (lines.length === 0 && !S.acceptEmpty) { return; }
+    log.textContent = lines.join('\n');
+    if (!S.userReadingHistory && atBottom) {
+      log.scrollTop = log.scrollHeight;
+    } else if (S.userReadingHistory) {
+      const newHeight = log.scrollHeight;
+      log.scrollTop = newHeight - (prevHeight - prevTop);
+    }
+  }catch(e){ printLogLine('[log] bağlantı hatası'); }
+}
+
+async function startTranslate(){
+  if(!S.file){ alert('Lütfen bir dosya seçin.'); return; }
+  const [engine, modelRaw] = ( $('#engineModel').value || 'nllb:nllb_ct2/600M-int8' ).split(':', 2);
+  const src = $('#sourceLang').value || 'auto';
+  const tgt = $('#targetLang').value || 'en';
+  const postEdit = $('#postEdit').value || '';
+  const fd = new FormData();
+  fd.append('file', S.file);
+  fd.append('source_lang', src);
+  fd.append('target_lang', tgt);
+  fd.append('engine', engine);
+  if (modelRaw) fd.append('model', modelRaw);
+  if (postEdit) fd.append('post_edit_model', postEdit);
+  $('#downloadSpan').innerHTML = '<span class="warn">Çeviriye başlandı:</span> ' + S.file.name;
+  printLogLine(`[ui] Çeviri başladı: ${S.file.name}`);
+  const res = await fetch(api('/translate'), { method:'POST', body: fd });
+  if(!res.ok){
+    const t = await res.text().catch(()=>res.statusText);
+    $('#downloadSpan').innerHTML = '<span class="danger">Hata:</span> ' + t;
+    return;
+  }
+  const out = await res.json();
+  printLogLine('[ui] Çeviri yanıtı: ' + JSON.stringify(out));
+  if(out && out.output_file){
+    const url = '/download?file=' + encodeURIComponent(out.output_file);
+    $('#downloadSpan').innerHTML = `<a class="btn primary fill" href="${url}">İndir: ${out.output_file}</a>`;
+  }else{
+    $('#downloadSpan').innerHTML = '<span class="ok">Tamamlandı.</span>';
+  }
+}
+
+async function refreshOllama(){
+  const btn = $('#refreshOllama');
+  btn.disabled = true; btn.textContent = 'Yenileniyor…';
+  try{ await fetch(api('/ollama/refresh')); }catch(e){}
+  await loadModels();
+  btn.disabled = false; btn.textContent = 'Ollama Modellerini Yenile';
+}
+
+async function boot(){
+  setupDragDrop();
+  await loadLanguages();
+  await loadModels();
+  if (S.polling) clearInterval(S.polling);
+  S.polling = setInterval(pollLogs, 2500);
+  pollLogs();
+  const logEl = $('#logs');
+  if (logEl) {
+    logEl.addEventListener('scroll', () => {
+      const nearTop = logEl.scrollTop <= 2;
+      const nearBottom = (logEl.scrollHeight - logEl.scrollTop - logEl.clientHeight) < 8;
+      if (nearTop && S.logLimit < 4000) {
+        S.userReadingHistory = true;
+        S.logLimit = Math.min(4000, S.logLimit + 200);
+        pollLogs();
+      } else if (nearBottom) {
+        S.userReadingHistory = false;
+      }
+    });
+  }
+
+  $('#startBtn').addEventListener('click', startTranslate);
+  $('#logsLabel').addEventListener('click', async () => { try { await fetch('/logs/clear', { method:'POST' }); } catch(e){} const el = $('#logs'); if (el) el.textContent=''; S.logLimit = 200; S.userReadingHistory = false; S.acceptEmpty = true; setTimeout(()=>{ S.acceptEmpty = false; }, 2000); });
+  $('#refreshOllama').addEventListener('click', refreshOllama);
+}
+boot();
+</script>
+</body>
+</html>
